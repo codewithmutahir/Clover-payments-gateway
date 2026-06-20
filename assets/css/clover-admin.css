@@ -1,0 +1,541 @@
+/**
+ * Clover Payment Gateway – Admin (blue theme, Elite Solution USA)
+ *
+ * @package Clover_Payment_Gateway
+ */
+
+/* Blue theme – matches elitesolutionusa.com */
+:root {
+	--clover-primary: #2563eb;
+	--clover-primary-dark: #1d4ed8;
+	--clover-primary-light: #3b82f6;
+	--clover-focus: rgba(37, 99, 235, 0.2);
+}
+
+/* ========== Payment method settings page ========== */
+body.clover-gateway-settings-page #wpbody-content .wrap {
+	max-width: 920px;
+	margin-bottom: 40px;
+}
+
+body.clover-gateway-settings-page .wrap > h1:first-child {
+	background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+	color: #fff;
+	margin: 0 0 0;
+	padding: 18px 24px;
+	font-size: 1.35em;
+	font-weight: 600;
+	border-radius: 8px 8px 0 0;
+	box-shadow: 0 2px 8px rgba(37, 99, 235, 0.25);
+	transition: box-shadow 0.2s ease;
+}
+
+body.clover-gateway-settings-page .wrap form,
+body.clover-gateway-settings-page .wrap table.form-table {
+	background: #fff;
+}
+
+body.clover-gateway-settings-page .wrap form {
+	border: 1px solid #e2e8f0;
+	border-top: none;
+	border-radius: 0 0 8px 8px;
+	box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+	padding: 28px 32px 28px;
+	margin: 0;
+	display: block;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table {
+	margin: 0;
+	width: 100%;
+	border-collapse: collapse;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table tbody tr {
+	vertical-align: middle;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table th {
+	padding: 15px 35px 16px 15px;
+	font-weight: 600;
+	color: #1e293b;
+	font-size: 13px;
+	width: 200px;
+	vertical-align: middle;
+	line-height: 1.4;
+}
+
+#wpfooter{
+	display: none !important
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table td {
+	padding: 16px 0;
+	color: #475569;
+	vertical-align: middle;
+	line-height: 1.4;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table td .woocommerce-input-wrapper,
+body.clover-gateway-settings-page .wrap form table.form-table td > input + span {
+	display: inline-flex;
+	align-items: center;
+	vertical-align: middle;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table input[type="text"],
+body.clover-gateway-settings-page .wrap form table.form-table input[type="password"],
+body.clover-gateway-settings-page .wrap form table.form-table textarea {
+	border-radius: 6px;
+	border: 1px solid #cbd5e1;
+	padding: 8px 12px;
+	font-size: 13px;
+	line-height: 1.4;
+	width: 100%;
+	max-width: 400px;
+	transition: border-color 0.2s ease, box-shadow 0.2s ease;
+	vertical-align: middle;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table input[type="checkbox"] {
+	vertical-align: middle;
+	margin: 0 6px 0 0;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table label {
+	vertical-align: middle;
+	line-height: 1.4;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table input:focus,
+body.clover-gateway-settings-page .wrap form table.form-table textarea:focus {
+	border-color: var(--clover-primary);
+	box-shadow: 0 0 0 2px var(--clover-focus);
+	outline: none;
+}
+
+body.clover-gateway-settings-page .wrap form .button-primary {
+	background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
+	border-color: #1d4ed8;
+	color: #fff;
+	border-radius: 6px;
+	padding: 6px 16px;
+	font-weight: 500;
+	box-shadow: 0 1px 3px rgba(37, 99, 235, 0.3);
+	transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+body.clover-gateway-settings-page .wrap form .button-primary:hover {
+	background: #1d4ed8;
+	border-color: #1e40af;
+	color: #fff;
+	transform: translateY(-1px);
+	box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35);
+}
+
+body.clover-gateway-settings-page .wrap form .button:not(.button-primary) {
+	border-radius: 6px;
+	border: 1px solid #cbd5e1;
+	background: #f8fafc;
+	color: #475569;
+	transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+body.clover-gateway-settings-page .wrap form .button:not(.button-primary):hover {
+	background: #e2e8f0;
+	border-color: #94a3b8;
+}
+
+body.clover-gateway-settings-page .wrap form table.form-table .description {
+	color: #64748b;
+	font-size: 12px;
+	margin: 6px 0 0 0;
+	line-height: 1.4;
+}
+
+body.clover-gateway-settings-page .wrap form p.submit {
+	margin-top: 24px;
+	margin-bottom: 0;
+	padding-top: 20px;
+	border-top: 1px solid #e2e8f0;
+}
+
+/* Copyright – inside content, clear spacing so it doesn’t touch WP footer */
+body.clover-gateway-settings-page .clover-plugin-copyright {
+	margin-top: 28px;
+	margin-bottom: 24px;
+	padding: 14px 20px;
+	background: #f8fafc;
+	border-radius: 8px;
+	border: 1px solid #e2e8f0;
+	color: #64748b;
+	font-size: 12px;
+}
+
+body.clover-gateway-settings-page .clover-plugin-copyright a {
+	color: var(--clover-primary);
+}
+
+/* ========== Clover Sync page ========== */
+.woocommerce_page_clover-inventory-sync .wrap {
+	max-width: 1200px;
+	margin-bottom: 48px;
+}
+
+.woocommerce_page_clover-inventory-sync .wrap > h1 {
+	background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+	color: #fff;
+	margin: 0 0 24px 0;
+	padding: 20px 24px;
+	font-size: 1.5em;
+	font-weight: 600;
+	border-radius: 8px;
+	box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);
+	transition: box-shadow 0.2s ease;
+}
+
+.clover-sync-card {
+	background: #fff;
+	border: 1px solid #e2e8f0;
+	box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+	border-radius: 10px;
+	padding: 24px 28px;
+	margin-bottom: 24px;
+	max-width: 1200px;
+	border-left: 4px solid var(--clover-primary);
+	transition: box-shadow 0.2s ease;
+}
+
+.clover-sync-card:hover {
+	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+}
+
+.clover-sync-card h2 {
+	margin: 0 0 12px 0;
+	padding-bottom: 12px;
+	border-bottom: 2px solid #e2e8f0;
+	font-size: 1.15em;
+	font-weight: 600;
+	color: #1e293b;
+}
+
+.clover-sync-card p {
+	color: #475569;
+	line-height: 1.55;
+	margin: 0 0 16px 0;
+}
+
+.clover-sync-card .button-primary {
+	background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
+	border-color: #1d4ed8;
+	color: #fff;
+	border-radius: 6px;
+	padding: 8px 18px;
+	font-weight: 500;
+	box-shadow: 0 1px 3px rgba(37, 99, 235, 0.3);
+	transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.clover-sync-card .button-primary:hover {
+	background: #1d4ed8;
+	border-color: #1e40af;
+	color: #fff;
+	transform: translateY(-1px);
+	box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35);
+}
+
+.clover-sync-card .button:not(.button-primary) {
+	border-radius: 6px;
+	border: 1px solid #cbd5e1;
+	background: #f8fafc;
+	color: #475569;
+	transition: background 0.2s ease;
+}
+
+.clover-sync-card .button:not(.button-primary):hover {
+	background: #e2e8f0;
+}
+
+.clover-sync-card #clover-export-progress {
+	border-radius: 8px;
+	overflow: hidden;
+	background: #e2e8f0;
+	height: 24px;
+}
+
+.clover-sync-card #clover-export-bar {
+	background: linear-gradient(90deg, #2563eb 0%, #3b82f6 100%);
+	height: 100%;
+	transition: width 0.35s ease;
+}
+
+.clover-sync-stats {
+	max-width: 380px;
+	border-radius: 8px;
+	overflow: hidden;
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.clover-sync-stats tbody tr:nth-child(odd) {
+	background: #f8fafc;
+}
+
+.clover-sync-stats td {
+	padding: 10px 14px;
+}
+
+.clover-sync-stats td:first-child {
+	font-weight: 600;
+	color: #475569;
+}
+
+.clover-sync-stats td:last-child {
+	text-align: right;
+	font-weight: 600;
+	color: var(--clover-primary);
+}
+
+.woocommerce_page_clover-inventory-sync .wp-list-table {
+	border-radius: 8px;
+	overflow: hidden;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+	border: 1px solid #e2e8f0;
+}
+
+.woocommerce_page_clover-inventory-sync .wp-list-table thead th {
+	background: #f1f5f9;
+	color: #1e293b;
+	font-weight: 600;
+	padding: 12px 14px;
+	border-bottom: 2px solid #e2e8f0;
+}
+
+.woocommerce_page_clover-inventory-sync .wp-list-table tbody tr {
+	transition: background 0.15s ease;
+}
+
+.woocommerce_page_clover-inventory-sync .wp-list-table tbody tr:hover {
+	background: #f8fafc;
+}
+
+.woocommerce_page_clover-inventory-sync .wp-list-table td {
+	padding: 12px 14px;
+	border-color: #e2e8f0;
+}
+
+.clover-badge {
+	display: inline-block;
+	padding: 4px 12px;
+	border-radius: 6px;
+	font-size: 12px;
+	font-weight: 600;
+}
+
+.clover-badge-linked {
+	background: #dbeafe;
+	color: #1e40af;
+	border: 1px solid #93c5fd;
+}
+
+.clover-badge-auto {
+	background: #dbeafe;
+	color: #1e40af;
+	border: 1px solid #93c5fd;
+}
+
+.clover-badge-review {
+	background: #fef3c7;
+	color: #92400e;
+	border: 1px solid #fcd34d;
+}
+
+.clover-badge-possible {
+	background: #fed7aa;
+	color: #9a3412;
+	border: 1px solid #fdba74;
+}
+
+.clover-badge-nomatch {
+	background: #fecaca;
+	color: #991b1b;
+	border: 1px solid #fca5a5;
+}
+
+.clover-action-cell .button {
+	margin-right: 6px;
+	border-radius: 6px;
+	transition: transform 0.15s ease;
+}
+
+.clover-action-cell .button:hover {
+	transform: translateY(-1px);
+}
+
+#clover-sync-message .notice {
+	margin: 12px 0;
+	border-radius: 6px;
+	border-left-width: 4px;
+	animation: cloverFadeIn 0.3s ease;
+}
+
+/* Copyright – above footer, never overlaps WP footer */
+.woocommerce_page_clover-inventory-sync .clover-plugin-copyright {
+	margin-top: 28px;
+	margin-bottom: 32px;
+	padding: 14px 20px;
+	background: #f8fafc;
+	border-radius: 8px;
+	border: 1px solid #e2e8f0;
+	color: #64748b;
+	font-size: 12px;
+}
+
+.clover-plugin-copyright a {
+	color: var(--clover-primary);
+	text-decoration: none;
+	font-weight: 500;
+}
+
+.clover-plugin-copyright a:hover {
+	text-decoration: underline;
+	color: var(--clover-primary-dark);
+}
+
+/* ========== Toast notification ========== */
+#clover-toast-container {
+	position: fixed;
+	bottom: 24px;
+	right: 24px;
+	z-index: 100002;
+	display: flex;
+	flex-direction: column-reverse;
+	gap: 10px;
+	pointer-events: none;
+}
+
+.clover-toast {
+	padding: 14px 20px;
+	border-radius: 8px;
+	box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+	font-size: 13px;
+	max-width: 360px;
+	pointer-events: auto;
+	animation: cloverToastIn 0.35s ease;
+}
+
+.clover-toast.clover-toast-out {
+	animation: cloverToastOut 0.3s ease forwards;
+}
+
+.clover-toast-success {
+	background: #eff6ff;
+	border-left: 4px solid var(--clover-primary);
+	color: #1e40af;
+}
+
+.clover-toast-error {
+	background: #fef2f2;
+	border-left: 4px solid #dc2626;
+	color: #991b1b;
+}
+
+.clover-toast-info {
+	background: #f0f9ff;
+	border-left: 4px solid #0ea5e9;
+	color: #0369a1;
+}
+
+@keyframes cloverToastIn {
+	from {
+		opacity: 0;
+		transform: translateX(24px);
+	}
+	to {
+		opacity: 1;
+		transform: translateX(0);
+	}
+}
+
+@keyframes cloverToastOut {
+	from {
+		opacity: 1;
+		transform: translateX(0);
+	}
+	to {
+		opacity: 0;
+		transform: translateX(24px);
+	}
+}
+
+@keyframes cloverFadeIn {
+	from { opacity: 0; }
+	to { opacity: 1; }
+}
+
+/* ========== Modal (replace confirm) ========== */
+#clover-modal-backdrop {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.4);
+	z-index: 100000;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 20px;
+	animation: cloverFadeIn 0.2s ease;
+}
+
+#clover-modal-box {
+	background: #fff;
+	border-radius: 12px;
+	box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+	max-width: 420px;
+	width: 100%;
+	padding: 24px;
+	animation: cloverModalIn 0.3s ease;
+}
+
+@keyframes cloverModalIn {
+	from {
+		opacity: 0;
+		transform: scale(0.95) translateY(-10px);
+	}
+	to {
+		opacity: 1;
+		transform: scale(1) translateY(0);
+	}
+}
+
+#clover-modal-box p {
+	margin: 0 0 20px;
+	color: #475569;
+	line-height: 1.5;
+	font-size: 14px;
+}
+
+#clover-modal-box .clover-modal-actions {
+	display: flex;
+	gap: 12px;
+	justify-content: flex-end;
+}
+
+#clover-modal-box .clover-modal-actions .button {
+	border-radius: 6px;
+	padding: 8px 18px;
+	transition: transform 0.15s ease;
+}
+
+#clover-modal-box .clover-modal-actions .button:hover {
+	transform: translateY(-1px);
+}
+
+#clover-modal-box .clover-modal-actions .button-primary {
+	background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
+	border-color: #1d4ed8;
+	color: #fff;
+}
+
+#clover-modal-box .clover-modal-actions .button-primary:hover {
+	background: #1d4ed8;
+	color: #fff;
+}

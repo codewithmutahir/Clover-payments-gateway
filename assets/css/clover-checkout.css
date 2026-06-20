@@ -1,0 +1,64 @@
+/**
+ * Clover Payment Gateway – Checkout payment form
+ *
+ * @package Clover_Payment_Gateway
+ */
+
+#wc-clover_gateway-cc-form {
+	margin-top: 12px;
+}
+
+.clover-card-fields {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	grid-gap: 14px;
+	margin-top: 12px;
+}
+
+.clover-card-field {
+	border: 1px solid #ddd;
+	border-radius: 6px;
+	padding: 8px 12px;
+	background: #fff;
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+	transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.clover-card-field:focus-within {
+	border-color: #2563eb;
+	box-shadow: 0 0 0 1px #2563eb;
+}
+
+.clover-card-field-label {
+	display: block;
+	font-size: 13px;
+	font-weight: 500;
+	color: #1e1e1e;
+	margin-bottom: 6px;
+}
+
+.clover-card-field-element {
+	height: 42px;
+	min-height: 42px;
+	max-height: 42px;
+	overflow: hidden;
+	display: flex;
+	align-items: center;
+}
+
+.clover-card-field-element iframe {
+	height: 42px !important;
+	min-height: 42px !important;
+	max-height: 42px !important;
+}
+
+.clover-card-row-full {
+	grid-column: 1 / -1;
+}
+
+@media (max-width: 600px) {
+	.clover-card-fields {
+		grid-template-columns: 1fr;
+	}
+}
+
