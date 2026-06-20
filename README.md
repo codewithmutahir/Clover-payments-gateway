@@ -372,10 +372,9 @@ See [readme.txt](readme.txt) for the WordPress.org-compatible changelog.
 
 ## Support
 
-- **Website:** [elitesolutionusa.com](https://elitesolutionusa.com)
 - **Issues:** [GitHub Issues](https://github.com/codewithmutahir/Clover-payments-gateway/issues)
 
-For license, billing, or setup assistance, contact Elite Solution USA through your purchase channel.
+For license, billing, or setup assistance, contact me
 
 ---
 
