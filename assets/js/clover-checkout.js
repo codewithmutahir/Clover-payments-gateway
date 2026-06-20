@@ -43,13 +43,16 @@
 
 	function showCheckoutError($form, message) {
 		$('.woocommerce-NoticeGroup-checkout').remove();
-		$form.prepend(
-			'<div class="woocommerce-NoticeGroup woocommerce-NoticeGroup-checkout">' +
-				'<ul class="woocommerce-error" role="alert">' +
-					'<li>' + message + '</li>' +
-				'</ul>' +
-			'</div>'
-		);
+		var $notice = $('<div>', {
+			class: 'woocommerce-NoticeGroup woocommerce-NoticeGroup-checkout'
+		});
+		var $list = $('<ul>', {
+			class: 'woocommerce-error',
+			role: 'alert'
+		});
+		$list.append($('<li>').text(message));
+		$notice.append($list);
+		$form.prepend($notice);
 		$('html, body').animate({ scrollTop: $form.offset().top - 100 }, 300);
 	}
 
