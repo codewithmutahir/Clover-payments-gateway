@@ -40,9 +40,6 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		add_action('woocommerce_update_options_payment_gateways_' . $this->id, array($this, 'process_admin_options'));
 		add_action('wp_enqueue_scripts', array($this, 'enqueue_scripts'));
 
-		// Sync COD and all other non-card payment methods to Clover.
-		add_action('woocommerce_order_status_changed', array($this, 'sync_non_card_order'), 10, 3);
-
 		// Display saved card details in WooCommerce admin order screen.
 		add_action('woocommerce_admin_order_data_after_order_details', array($this, 'display_card_details_admin'), 10, 1);
 
@@ -364,85 +361,6 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 			'result'   => 'success',
 			'redirect' => $this->get_return_url($order),
 		);
-	}
-
-	/**
-	 * Sync COD and all other non-card orders to Clover.
-	 * Fires when any WooCommerce order status changes to processing or on-hold.
-	 *
-	 * @param int    $order_id   Order ID.
-	 * @param string $old_status Previous status.
-	 * @param string $new_status New status.
-	 */
-	public function sync_non_card_order($order_id, $old_status, $new_status)
-	{
-
-		// Only act on these statuses.
-		if (! in_array($new_status, array('processing', 'on-hold'), true)) {
-			return;
-		}
-
-		// Skip if already synced by process_payment() or a previous status change.
-		if (get_post_meta($order_id, '_clover_order_id', true)) {
-			return;
-		}
-
-		$order = wc_get_order($order_id);
-		if (! $order) {
-			return;
-		}
-
-		if (method_exists($order, 'calculate_totals')) {
-			$order->calculate_totals();
-		}
-
-		// Skip if this order was paid via our own gateway — process_payment() already handled it.
-		if ($order->get_payment_method() === $this->id) {
-			return;
-		}
-
-		// Skip if plugin is not properly configured.
-		if (empty($this->merchant_id) || empty($this->api_token)) {
-			error_log('Clover Sync: Plugin not configured. Skipping order #' . $order_id);
-			return;
-		}
-
-		$api = new Clover_API(
-			$this->merchant_id,
-			$this->api_token,
-			$this->public_key,
-			$this->private_key,
-			$this->test_mode,
-			$this->default_tax_rate_id
-		);
-
-		// Create Clover order with real item names.
-		$clover_order = $api->create_order_with_items($order);
-
-		if (! empty($clover_order['success'])) {
-			$clover_order_id = $clover_order['clover_order_id'];
-			$amount_cents    = (int) round((float) $order->get_total() * 100);
-
-			// Fire to kitchen/printer. Order stays Open in Clover until closed on device.
-			$api->fire_order($clover_order_id);
-
-			// Save meta so it never syncs twice.
-			update_post_meta($order_id, '_clover_order_id', $clover_order_id);
-			update_post_meta($order_id, '_clover_amount_cents', $amount_cents);
-
-			$order->add_order_note(
-				sprintf(
-					__('Order synced to Clover (%s). Clover Order ID: %s', 'clover-gateway'),
-					$order->get_payment_method_title(),
-					$clover_order_id
-				)
-			);
-
-			error_log('Clover Sync: ✅ Order #' . $order_id . ' (' . $order->get_payment_method_title() . ') synced as ' . $clover_order_id);
-		} else {
-			$message = ! empty($clover_order['message']) ? $clover_order['message'] : 'Unknown error';
-			error_log('Clover Sync: ❌ Failed for order #' . $order_id . ' - ' . $message);
-		}
 	}
 
 	/**

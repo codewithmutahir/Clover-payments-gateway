@@ -136,6 +136,7 @@ class Clover_Gateway_Plugin {
 	protected function includes() {
 		require_once WC_CLOVER_GATEWAY_PLUGIN_DIR . 'includes/class-clover-license-setup.php';
 		require_once WC_CLOVER_GATEWAY_PLUGIN_DIR . 'includes/class-clover-api.php';
+		require_once WC_CLOVER_GATEWAY_PLUGIN_DIR . 'includes/class-clover-order-sync.php';
 		require_once WC_CLOVER_GATEWAY_PLUGIN_DIR . 'includes/class-wc-clover-gateway.php';
 		require_once WC_CLOVER_GATEWAY_PLUGIN_DIR . 'includes/class-clover-admin.php';
 		require_once WC_CLOVER_GATEWAY_PLUGIN_DIR . 'includes/class-clover-inventory-sync.php';
@@ -154,6 +155,7 @@ class Clover_Gateway_Plugin {
 			return;
 		}
 
+		Clover_Order_Sync::instance();
 		Clover_Inventory_Sync::instance();
 
 		if ( is_admin() ) {

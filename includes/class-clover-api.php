@@ -56,6 +56,44 @@ class Clover_API
 			: 'https://scl.clover.com/v1';
 	}
 
+	/**
+	 * Human-readable message from a failed v3 API response.
+	 *
+	 * @param array  $result   Response from request_v3().
+	 * @param string $fallback Default message.
+	 * @return string
+	 */
+	protected function api_error_message($result, $fallback = '')
+	{
+		if (! is_array($result)) {
+			return $fallback ?: __('Clover API request failed.', 'clover-gateway');
+		}
+
+		if (! empty($result['data']) && is_array($result['data'])) {
+			if (! empty($result['data']['message'])) {
+				return (string) $result['data']['message'];
+			}
+			if (! empty($result['data']['error']['message'])) {
+				return (string) $result['data']['error']['message'];
+			}
+		}
+
+		if (! empty($result['message']) && __('Payment could not be processed. Please try again.', 'clover-gateway') !== $result['message']) {
+			return (string) $result['message'];
+		}
+
+		$code = isset($result['http_code']) ? (int) $result['http_code'] : 0;
+		if ($code > 0) {
+			return sprintf(
+				/* translators: %d: HTTP status code */
+				__('Clover API HTTP %d', 'clover-gateway'),
+				$code
+			);
+		}
+
+		return $fallback ?: __('Clover API request failed.', 'clover-gateway');
+	}
+
 	protected function request_v3($method, $path, $body = array(), $query = array())
 	{
 		$url = $this->get_v3_base_url() . $path;
@@ -83,7 +121,7 @@ class Clover_API
 				'success'   => false,
 				'ambiguous' => true,
 				'http_code' => 0,
-				'message'   => __('Payment could not be processed. Please try again.', 'clover-gateway'),
+				'message'   => $response->get_error_message(),
 			);
 		}
 
@@ -93,13 +131,14 @@ class Clover_API
 		if ($code < 200 || $code >= 300) {
 			error_log('Clover v3 API HTTP ' . $code . ': ' . wp_json_encode($body));
 			$ambiguous = ($code >= 500 || in_array((int) $code, array(408, 429), true));
-			return array(
+			$payload   = array(
 				'success'   => false,
 				'ambiguous' => $ambiguous,
 				'http_code' => (int) $code,
-				'message'   => __('Payment could not be processed. Please try again.', 'clover-gateway'),
 				'data'      => $body,
 			);
+			$payload['message'] = $this->api_error_message($payload);
+			return $payload;
 		}
 
 		return array('success' => true, 'data' => $body);
@@ -186,33 +225,98 @@ class Clover_API
 	 *                                      line item creation payload so Clover records it in the Tax Report.
 	 *                                      Pass false for shipping/fees to avoid taxing non-product lines.
 	 *
-	 * @return string|false Clover line item ID on success, false on failure.
+	 * @return array{success:bool,id?:string,message?:string}
 	 */
-	protected function add_line_item($clover_order_id, $name, $price_cents, $clover_item_id = null, $apply_tax = false, $unit_qty = 1)
+	protected function add_line_item($clover_order_id, $name, $price_cents, $clover_item_id = null, $apply_tax = false, $unit_qty = 1000)
 	{
-		$unit_qty = max(1, (int) $unit_qty);
+		$unit_qty = max(1000, (int) $unit_qty);
+		$attempts = array();
 
+		if (! empty($clover_item_id) && is_string($clover_item_id)) {
+			$attempts[] = array(
+				'item_id'   => trim($clover_item_id),
+				'apply_tax' => (bool) $apply_tax,
+			);
+		}
+
+		$attempts[] = array(
+			'item_id'   => null,
+			'apply_tax' => (bool) $apply_tax,
+		);
+
+		if ($apply_tax) {
+			$attempts[] = array(
+				'item_id'   => null,
+				'apply_tax' => false,
+			);
+		}
+
+		$last_result = null;
+
+		foreach ($attempts as $attempt) {
+			$body = $this->build_line_item_request_body(
+				$name,
+				(int) $price_cents,
+				$unit_qty,
+				$attempt['item_id'],
+				$attempt['apply_tax']
+			);
+
+			$result = $this->request_v3(
+				'POST',
+				'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id) . '/line_items',
+				$body
+			);
+
+			$last_result = $result;
+
+			if (! empty($result['success']) && ! empty($result['data']['id'])) {
+				return array(
+					'success' => true,
+					'id'      => (string) $result['data']['id'],
+				);
+			}
+		}
+
+		error_log(
+			'Clover: Failed to add line item "' . $name . '" to order ' . $clover_order_id
+				. ' — ' . wp_json_encode(isset($last_result['data']) ? $last_result['data'] : $last_result)
+		);
+
+		return array(
+			'success' => false,
+			'message' => $this->api_error_message($last_result),
+		);
+	}
+
+	/**
+	 * Build the POST body for a single Clover order line item.
+	 *
+	 * @param string      $name         Line item name.
+	 * @param int         $price_cents  Unit price in cents.
+	 * @param int         $unit_qty     Quantity in Clover milli-units.
+	 * @param string|null $clover_item_id Optional inventory item ID.
+	 * @param bool        $apply_tax    Whether to embed default tax metadata.
+	 * @return array<string,mixed>
+	 */
+	protected function build_line_item_request_body($name, $price_cents, $unit_qty, $clover_item_id = null, $apply_tax = false)
+	{
 		if (! empty($clover_item_id) && is_string($clover_item_id)) {
 			$body = array(
 				'item'    => array('id' => trim($clover_item_id)),
 				'price'   => (int) $price_cents,
-				'unitQty' => $unit_qty,
+				'unitQty' => (int) $unit_qty,
 				'printed' => false,
 			);
 		} else {
 			$body = array(
 				'name'    => $name,
 				'price'   => (int) $price_cents,
-				'unitQty' => $unit_qty,
+				'unitQty' => (int) $unit_qty,
 				'printed' => false,
 			);
 		}
 
-		// Embed the full tax rate object AND the pre-calculated taxAmount on the line item.
-		// taxRates  → tells Clover which rate applies (affects receipt display + rate association).
-		// taxAmount → the explicit cents value; this is what Clover's Tax Report reads directly.
-		// Both are needed: taxRates alone is silently ignored for API orders, and taxAmount alone
-		// is not attributed to a named rate without taxRates.
 		if ($apply_tax && ! empty($this->default_tax_rate_id)) {
 			$full_rate    = $this->get_tax_rate_by_id($this->default_tax_rate_id);
 			$rate_element = array('id' => $this->default_tax_rate_id);
@@ -221,10 +325,9 @@ class Clover_API
 				$rate_element['name'] = isset($full_rate['name']) ? $full_rate['name'] : '';
 				$rate_element['rate'] = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
 
-				// Pre-calculate the tax for this line item in cents.
-				// Clover stores rate as integer where 875000 = 8.75% (i.e. rate / 10,000,000 = decimal).
 				if ($rate_element['rate'] > 0) {
-					$body['taxAmount'] = (int) round($price_cents * $rate_element['rate'] / 10000000);
+					$line_total_cents = (int) round($price_cents * $unit_qty / 1000);
+					$body['taxAmount'] = (int) round($line_total_cents * $rate_element['rate'] / 10000000);
 				}
 			}
 
@@ -233,18 +336,7 @@ class Clover_API
 			);
 		}
 
-		$result = $this->request_v3(
-			'POST',
-			'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id) . '/line_items',
-			$body
-		);
-
-		if (! $result['success'] || empty($result['data']['id'])) {
-			error_log('Clover: Failed to add line item "' . $name . '" to order ' . $clover_order_id . ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result));
-			return false;
-		}
-
-		return $result['data']['id'];
+		return $body;
 	}
 
 	/**
@@ -321,6 +413,117 @@ class Clover_API
 	}
 
 	/**
+	 * Clover line-item quantity in milli-units (qty 1 => 1000).
+	 *
+	 * @param int $quantity Human-readable quantity.
+	 * @return int
+	 */
+	protected function clover_unit_qty($quantity)
+	{
+		return max(1000, (int) $quantity * 1000);
+	}
+
+	/**
+	 * Build atomic-order line items (simpler payload — matches Clover POS expectations).
+	 *
+	 * @param WC_Order $order WooCommerce order.
+	 * @return array{elements:array<int,array<string,mixed>>}
+	 */
+	protected function build_atomic_line_items($order)
+	{
+		$elements = array();
+		$currency = $order->get_currency();
+
+		foreach ($order->get_items() as $item) {
+			$quantity = (int) $item->get_quantity();
+			$total    = (float) $item->get_total();
+
+			if ($quantity <= 0) {
+				continue;
+			}
+
+			$unit_price_cents = (int) round(($total / $quantity) * 100);
+
+			$li = array(
+				'name'    => $item->get_name(),
+				'price'   => $unit_price_cents,
+				'unitQty' => $this->clover_unit_qty($quantity),
+				'printed' => false,
+			);
+
+			$product_id   = $item->get_product_id();
+			$variation_id = method_exists($item, 'get_variation_id') ? (int) $item->get_variation_id() : 0;
+			$lookup_id    = $variation_id ? $variation_id : $product_id;
+
+			if ($lookup_id && (bool) apply_filters('clover_gateway_link_inventory_items', false, $order, $item)) {
+				$clover_item_id = get_post_meta($lookup_id, '_clover_item_id', true);
+				if (empty($clover_item_id) && $variation_id && $product_id) {
+					$clover_item_id = get_post_meta($product_id, '_clover_item_id', true);
+				}
+				if (! empty($clover_item_id) && is_string($clover_item_id)) {
+					$li['item'] = array('id' => trim($clover_item_id));
+				}
+			}
+
+			$elements[] = $li;
+		}
+
+		$shipping_total = (float) $order->get_shipping_total();
+		if ($shipping_total > 0) {
+			$shipping_label = __('Shipping', 'clover-gateway');
+			$shipping_method = $order->get_shipping_method();
+			if ($shipping_method) {
+				$shipping_label = sprintf(__('Shipping: %s', 'clover-gateway'), $shipping_method);
+			}
+
+			$elements[] = array(
+				'name'    => $shipping_label,
+				'price'   => (int) round($shipping_total * 100),
+				'unitQty' => 1000,
+				'printed' => false,
+			);
+		}
+
+		foreach ($order->get_fees() as $fee) {
+			$fee_total = (float) $fee->get_total();
+			$fee_name  = $fee->get_name();
+
+			if (abs($fee_total) <= 0 || stripos($fee_name, 'tax') !== false) {
+				continue;
+			}
+
+			$elements[] = array(
+				'name'    => $fee_name,
+				'price'   => (int) round($fee_total * 100),
+				'unitQty' => 1000,
+				'printed' => false,
+			);
+		}
+
+		$tax_total = (float) $order->get_total_tax();
+		if ($tax_total > 0) {
+			$elements[] = array(
+				'name'    => __('Tax', 'clover-gateway'),
+				'price'   => (int) round($tax_total * 100),
+				'unitQty' => 1000,
+				'printed' => false,
+			);
+		}
+
+		$discount_total = (float) $order->get_discount_total();
+		if ($discount_total > 0) {
+			$elements[] = array(
+				'name'    => __('Discount', 'clover-gateway'),
+				'price'   => -1 * abs((int) round($discount_total * 100)),
+				'unitQty' => 1000,
+				'printed' => false,
+			);
+		}
+
+		return array('elements' => $elements);
+	}
+
+	/**
 	 * Build Clover line item payloads from a WooCommerce order.
 	 *
 	 * @param WC_Order $order WooCommerce order.
@@ -369,7 +572,7 @@ class Clover_API
 			$li = array(
 				'name'    => $item->get_name(),
 				'price'   => $unit_price_cents,
-				'unitQty' => $quantity,
+				'unitQty' => $this->clover_unit_qty($quantity),
 				'printed' => false,
 			);
 
@@ -411,7 +614,7 @@ class Clover_API
 			$elements[] = array(
 				'name'      => $shipping_label,
 				'price'     => (int) round($shipping_total * 100),
-				'unitQty'   => 1,
+				'unitQty'   => 1000,
 				'printed'   => false,
 				'apply_tax' => false,
 			);
@@ -428,7 +631,7 @@ class Clover_API
 			$elements[] = array(
 				'name'      => $fee_name,
 				'price'     => (int) round($fee_total * 100),
-				'unitQty'   => 1,
+				'unitQty'   => 1000,
 				'printed'   => false,
 				'apply_tax' => false,
 			);
@@ -719,10 +922,13 @@ class Clover_API
 				);
 			}
 
-			return array('failure' => 'ambiguous');
+			return array('failure' => 'ambiguous', 'message' => $this->api_error_message($result));
 		}
 
-		return array('failure' => 'deterministic');
+		return array(
+			'failure' => 'deterministic',
+			'message' => $this->api_error_message($result),
+		);
 	}
 
 	/**
@@ -744,15 +950,18 @@ class Clover_API
 	 */
 	protected function create_atomic_order($order)
 	{
-		$line_data  = $this->build_line_items_from_order($order);
+		$line_data  = $this->build_atomic_line_items($order);
 		$line_items = $line_data['elements'];
 
 		if (empty($line_items)) {
 			error_log('Clover: No line items to sync for WC order #' . $order->get_order_number());
-			return false;
+			return array(
+				'failure' => 'deterministic',
+				'message' => __('No line items could be mapped for Clover.', 'clover-gateway'),
+			);
 		}
 
-		$tax_cents   = $this->calculate_order_tax_cents($order);
+		$tax_cents   = (int) round((float) $order->get_total_tax() * 100);
 		$total_cents = (int) round((float) $order->get_total() * 100);
 
 		$payload = array(
@@ -761,14 +970,10 @@ class Clover_API
 			'note'           => $this->build_order_note($order),
 			'currency'       => strtoupper($order->get_currency() ?: 'USD'),
 			'total'          => $total_cents,
-			'lineItems'      => array('elements' => $this->sanitize_line_items_for_api($line_items)),
+			'lineItems'      => $line_data,
 			'testMode'       => (bool) $this->test_mode,
 			'groupLineItems' => true,
 		);
-
-		if ($tax_cents > 0) {
-			$payload['taxAmount'] = (int) $tax_cents;
-		}
 
 		$result = $this->request_v3(
 			'POST',
@@ -787,14 +992,17 @@ class Clover_API
 	 */
 	protected function create_order_sequential($order)
 	{
-		$line_data  = $this->build_line_items_from_order($order);
+		$line_data  = $this->build_atomic_line_items($order);
 		$line_items = $line_data['elements'];
 
 		if (empty($line_items)) {
-			return false;
+			return array(
+				'failure' => 'deterministic',
+				'message' => __('No line items could be mapped for Clover.', 'clover-gateway'),
+			);
 		}
 
-		$tax_cents   = $this->calculate_order_tax_cents($order);
+		$tax_cents   = (int) round((float) $order->get_total_tax() * 100);
 		$total_cents = (int) round((float) $order->get_total() * 100);
 
 		$result = $this->request_v3(
@@ -821,16 +1029,19 @@ class Clover_API
 		$line_item_total = count($line_items);
 
 		foreach ($line_items as $index => $li) {
-			$is_product = ! empty($li['apply_tax']);
-			$name       = isset($li['name']) ? $li['name'] : '';
-			$price      = isset($li['price']) ? (int) $li['price'] : 0;
-			$qty        = isset($li['unitQty']) ? (int) $li['unitQty'] : 1;
-			$item_id    = ! empty($li['clover_item_id']) ? $li['clover_item_id'] : null;
+			$name    = isset($li['name']) ? $li['name'] : '';
+			$price   = isset($li['price']) ? (int) $li['price'] : 0;
+			$qty     = isset($li['unitQty']) ? (int) $li['unitQty'] : 1000;
+			$item_id = isset($li['item']['id']) ? $li['item']['id'] : null;
 
-			$line_item_id = $this->add_line_item($clover_order_id, $name, $price, $item_id, $is_product, $qty);
+			$added = $this->add_line_item($clover_order_id, $name, $price, $item_id, false, $qty);
 
-			if (! $line_item_id) {
-				error_log('Clover: Sequential line item failed for "' . $name . '" on order ' . $clover_order_id);
+			if (empty($added['success']) || empty($added['id'])) {
+				$api_message = ! empty($added['message']) ? (string) $added['message'] : '';
+				error_log(
+					'Clover: Sequential line item failed for "' . $name . '" on order ' . $clover_order_id
+						. ($api_message ? ' — ' . $api_message : '')
+				);
 
 				$existing = $this->lookup_existing_clover_order($order, $line_item_total);
 				if ($existing && ! empty($existing['id'])) {
@@ -854,18 +1065,27 @@ class Clover_API
 				}
 
 				$this->delete_clover_order($clover_order_id);
-				return array('failure' => 'deterministic');
-			}
 
-			if ($is_product) {
-				$this->apply_line_item_tax_rate($clover_order_id, $line_item_id);
+				$message = $api_message
+					? sprintf(
+						/* translators: 1: line item name, 2: Clover API error */
+						__('Failed to add "%1$s" to Clover order: %2$s', 'clover-gateway'),
+						$name,
+						$api_message
+					)
+					: sprintf(
+						/* translators: %s: line item name */
+						__('Failed to add line item "%s" to Clover order.', 'clover-gateway'),
+						$name
+					);
+
+				return array(
+					'failure' => 'deterministic',
+					'message' => $message,
+				);
 			}
 
 			usleep(200000);
-		}
-
-		if ($tax_cents > 0) {
-			$this->update_order_tax_amount($clover_order_id, $tax_cents);
 		}
 
 		$this->update_order_total($clover_order_id, $total_cents);
@@ -922,21 +1142,37 @@ class Clover_API
 	{
 		$this->ensure_order_totals($order);
 
-		$created = $this->create_atomic_order($order);
+		$created        = $this->create_atomic_order($order);
+		$atomic_failure = null;
 
 		if ($this->is_order_creation_failure($created)) {
-			if ('deterministic' === $created['failure']) {
-				error_log('Clover: Falling back to sequential order creation for WC order #' . $order->get_order_number());
-				$created = $this->create_order_sequential($order);
-			}
+			$atomic_failure = $created;
+			error_log(
+				'Clover: Atomic order creation failed for WC order #' . $order->get_order_number()
+					. ' — falling back to sequential. '
+					. (isset($created['message']) ? $created['message'] : '')
+			);
+			$created = $this->create_order_sequential($order);
 		}
 
 		if ($this->is_order_creation_failure($created)) {
-			return array('success' => false, 'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'));
+			$message = '';
+			if (! empty($created['message'])) {
+				$message = (string) $created['message'];
+			} elseif ($atomic_failure && ! empty($atomic_failure['message'])) {
+				$message = (string) $atomic_failure['message'];
+			}
+			if ('' === $message) {
+				$message = __('Order could not be created in Clover.', 'clover-gateway');
+			}
+			return array('success' => false, 'message' => $message);
 		}
 
 		if (false === $created || empty($created['clover_order_id'])) {
-			return array('success' => false, 'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'));
+			return array(
+				'success' => false,
+				'message' => __('Order could not be created in Clover.', 'clover-gateway'),
+			);
 		}
 
 		return array(
