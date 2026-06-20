@@ -79,7 +79,12 @@ class Clover_API
 
 		if (is_wp_error($response)) {
 			error_log('Clover v3 API error: ' . $response->get_error_message());
-			return array('success' => false, 'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'));
+			return array(
+				'success'   => false,
+				'ambiguous' => true,
+				'http_code' => 0,
+				'message'   => __('Payment could not be processed. Please try again.', 'clover-gateway'),
+			);
 		}
 
 		$code = wp_remote_retrieve_response_code($response);
@@ -87,7 +92,14 @@ class Clover_API
 
 		if ($code < 200 || $code >= 300) {
 			error_log('Clover v3 API HTTP ' . $code . ': ' . wp_json_encode($body));
-			return array('success' => false, 'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'), 'data' => $body);
+			$ambiguous = ($code >= 500 || in_array((int) $code, array(408, 429), true));
+			return array(
+				'success'   => false,
+				'ambiguous' => $ambiguous,
+				'http_code' => (int) $code,
+				'message'   => __('Payment could not be processed. Please try again.', 'clover-gateway'),
+				'data'      => $body,
+			);
 		}
 
 		return array('success' => true, 'data' => $body);
@@ -346,7 +358,11 @@ class Clover_API
 				$cache_key = 'clover_itax_' . md5($clover_item_id . '_' . $this->default_tax_rate_id);
 				if (! get_transient($cache_key)) {
 					$assigned = $this->assign_item_tax_rate($clover_item_id, $this->default_tax_rate_id);
-					set_transient($cache_key, $assigned ? 'ok' : 'attempted', 7 * DAY_IN_SECONDS);
+					set_transient(
+						$cache_key,
+						$assigned ? 'ok' : 'attempted',
+						$assigned ? 7 * DAY_IN_SECONDS : HOUR_IN_SECONDS
+					);
 				}
 			}
 
@@ -512,6 +528,215 @@ class Clover_API
 	}
 
 	/**
+	 * Whether a failed v3 API response may have succeeded server-side (timeout, 5xx, etc.).
+	 *
+	 * @param array $result Response from request_v3().
+	 * @return bool
+	 */
+	protected function is_ambiguous_api_failure($result)
+	{
+		if (! empty($result['success'])) {
+			return false;
+		}
+
+		if (! empty($result['ambiguous'])) {
+			return true;
+		}
+
+		$code = isset($result['http_code']) ? (int) $result['http_code'] : 0;
+
+		return $code <= 0 || $code >= 500 || in_array($code, array(408, 429), true);
+	}
+
+	/**
+	 * Build the Clover order title used for idempotent lookups.
+	 *
+	 * @param WC_Order $order WooCommerce order.
+	 * @return string
+	 */
+	protected function get_order_title($order)
+	{
+		return 'Order #' . $order->get_order_number();
+	}
+
+	/**
+	 * Count line items on a Clover order payload (requires lineItems expand).
+	 *
+	 * @param array $clover_order Clover order object.
+	 * @return int
+	 */
+	protected function count_clover_line_items($clover_order)
+	{
+		if (empty($clover_order['lineItems']['elements']) || ! is_array($clover_order['lineItems']['elements'])) {
+			return 0;
+		}
+
+		return count($clover_order['lineItems']['elements']);
+	}
+
+	/**
+	 * Fetch Clover orders matching a title (last 90 days per Clover filter limits).
+	 *
+	 * @param string $title Order title.
+	 * @return array
+	 */
+	protected function find_clover_orders_by_title($title)
+	{
+		$result = $this->request_v3(
+			'GET',
+			'/merchants/' . rawurlencode($this->merchant_id) . '/orders',
+			array(),
+			array(
+				'filter' => 'title=' . $title,
+				'expand' => 'lineItems',
+				'limit'  => 5,
+			)
+		);
+
+		if (empty($result['success']) || empty($result['data']['elements'])) {
+			return array();
+		}
+
+		return $result['data']['elements'];
+	}
+
+	/**
+	 * Idempotent lookup for an existing Clover order created for this WooCommerce order.
+	 *
+	 * @param WC_Order $order                 WooCommerce order.
+	 * @param int|null $expected_line_count   Minimum line items required to treat as complete.
+	 * @return array|null Clover order object or null.
+	 */
+	protected function lookup_existing_clover_order($order, $expected_line_count = null)
+	{
+		$title = $this->get_order_title($order);
+
+		foreach ($this->find_clover_orders_by_title($title) as $clover_order) {
+			$order_test_mode = ! empty($clover_order['testMode']);
+			if ($order_test_mode !== (bool) $this->test_mode) {
+				continue;
+			}
+
+			if (null !== $expected_line_count) {
+				if ($this->count_clover_line_items($clover_order) >= (int) $expected_line_count) {
+					return $clover_order;
+				}
+				continue;
+			}
+
+			if (! empty($clover_order['id'])) {
+				return $clover_order;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Fetch the current line-item count for a Clover order.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return int
+	 */
+	protected function get_order_line_item_count($clover_order_id)
+	{
+		$result = $this->request_v3(
+			'GET',
+			'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id),
+			array(),
+			array('expand' => 'lineItems')
+		);
+
+		if (empty($result['success']) || empty($result['data'])) {
+			return 0;
+		}
+
+		return $this->count_clover_line_items($result['data']);
+	}
+
+	/**
+	 * Delete an orphaned Clover order shell.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return bool
+	 */
+	protected function delete_clover_order($clover_order_id)
+	{
+		if (empty($clover_order_id)) {
+			return false;
+		}
+
+		$result = $this->request_v3(
+			'DELETE',
+			'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id)
+		);
+
+		if (empty($result['success'])) {
+			error_log('Clover: Failed to delete orphaned order ' . $clover_order_id . ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result));
+			return false;
+		}
+
+		error_log('Clover: Deleted orphaned order ' . $clover_order_id);
+		return true;
+	}
+
+	/**
+	 * Parse an order-creation API response, recovering from ambiguous failures when possible.
+	 *
+	 * @param WC_Order $order               WooCommerce order.
+	 * @param array    $result              Response from request_v3().
+	 * @param int      $tax_cents           Tax in cents.
+	 * @param int      $total_cents         Total in cents.
+	 * @param int      $expected_line_count Expected line item count.
+	 * @return array Result array, or array with 'failure' => 'ambiguous'|'deterministic'.
+	 */
+	protected function parse_order_create_api_result($order, $result, $tax_cents, $total_cents, $expected_line_count)
+	{
+		if (! empty($result['success']) && ! empty($result['data']['id'])) {
+			return array(
+				'clover_order_id' => $result['data']['id'],
+				'tax_cents'       => $tax_cents,
+				'total_cents'     => $total_cents,
+			);
+		}
+
+		error_log(
+			'Clover: order creation failed for WC order #' . $order->get_order_number()
+				. ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result)
+		);
+
+		if ($this->is_ambiguous_api_failure($result)) {
+			$existing = $this->lookup_existing_clover_order($order, $expected_line_count);
+			if ($existing && ! empty($existing['id'])) {
+				error_log(
+					'Clover: Recovered existing order ' . $existing['id']
+						. ' after ambiguous failure for WC order #' . $order->get_order_number()
+				);
+				return array(
+					'clover_order_id' => $existing['id'],
+					'tax_cents'       => $tax_cents,
+					'total_cents'     => $total_cents,
+				);
+			}
+
+			return array('failure' => 'ambiguous');
+		}
+
+		return array('failure' => 'deterministic');
+	}
+
+	/**
+	 * Whether an order creation helper returned a failure marker instead of a Clover order.
+	 *
+	 * @param array|false $result Result from create_atomic_order() or create_order_sequential().
+	 * @return bool
+	 */
+	protected function is_order_creation_failure($result)
+	{
+		return is_array($result) && isset($result['failure']);
+	}
+
+	/**
 	 * Create Clover order via atomic_order API (preferred — single call with all line items).
 	 *
 	 * @param WC_Order $order WooCommerce order.
@@ -532,7 +757,7 @@ class Clover_API
 
 		$payload = array(
 			'state'          => 'open',
-			'title'          => 'Order #' . $order->get_order_number(),
+			'title'          => $this->get_order_title($order),
 			'note'           => $this->build_order_note($order),
 			'currency'       => strtoupper($order->get_currency() ?: 'USD'),
 			'total'          => $total_cents,
@@ -551,16 +776,7 @@ class Clover_API
 			$payload
 		);
 
-		if (! $result['success'] || empty($result['data']['id'])) {
-			error_log('Clover: atomic_order failed for WC order #' . $order->get_order_number() . ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result));
-			return false;
-		}
-
-		return array(
-			'clover_order_id' => $result['data']['id'],
-			'tax_cents'       => $tax_cents,
-			'total_cents'     => $total_cents,
-		);
+		return $this->parse_order_create_api_result($order, $result, $tax_cents, $total_cents, count($line_items));
 	}
 
 	/**
@@ -586,7 +802,7 @@ class Clover_API
 			'/merchants/' . rawurlencode($this->merchant_id) . '/orders',
 			array(
 				'state'             => 'open',
-				'title'             => 'Order #' . $order->get_order_number(),
+				'title'             => $this->get_order_title($order),
 				'manualTransaction' => false,
 				'groupLineItems'    => true,
 				'testMode'          => (bool) $this->test_mode,
@@ -596,13 +812,15 @@ class Clover_API
 			)
 		);
 
-		if (! $result['success'] || empty($result['data']['id'])) {
-			return false;
+		$parsed = $this->parse_order_create_api_result($order, $result, $tax_cents, $total_cents, count($line_items));
+		if ($this->is_order_creation_failure($parsed)) {
+			return $parsed;
 		}
 
-		$clover_order_id = $result['data']['id'];
+		$clover_order_id = $parsed['clover_order_id'];
+		$line_item_total = count($line_items);
 
-		foreach ($line_items as $li) {
+		foreach ($line_items as $index => $li) {
 			$is_product = ! empty($li['apply_tax']);
 			$name       = isset($li['name']) ? $li['name'] : '';
 			$price      = isset($li['price']) ? (int) $li['price'] : 0;
@@ -613,7 +831,30 @@ class Clover_API
 
 			if (! $line_item_id) {
 				error_log('Clover: Sequential line item failed for "' . $name . '" on order ' . $clover_order_id);
-				return false;
+
+				$existing = $this->lookup_existing_clover_order($order, $line_item_total);
+				if ($existing && ! empty($existing['id'])) {
+					if ($existing['id'] !== $clover_order_id) {
+						$this->delete_clover_order($clover_order_id);
+						return array(
+							'clover_order_id' => $existing['id'],
+							'tax_cents'       => $tax_cents,
+							'total_cents'     => $total_cents,
+						);
+					}
+					if ($this->count_clover_line_items($existing) >= $line_item_total) {
+						break;
+					}
+				}
+
+				$actual_count = $this->get_order_line_item_count($clover_order_id);
+				if ($actual_count >= ($index + 1)) {
+					usleep(200000);
+					continue;
+				}
+
+				$this->delete_clover_order($clover_order_id);
+				return array('failure' => 'deterministic');
 			}
 
 			if ($is_product) {
@@ -683,9 +924,15 @@ class Clover_API
 
 		$created = $this->create_atomic_order($order);
 
-		if (false === $created) {
-			error_log('Clover: Falling back to sequential order creation for WC order #' . $order->get_order_number());
-			$created = $this->create_order_sequential($order);
+		if ($this->is_order_creation_failure($created)) {
+			if ('deterministic' === $created['failure']) {
+				error_log('Clover: Falling back to sequential order creation for WC order #' . $order->get_order_number());
+				$created = $this->create_order_sequential($order);
+			}
+		}
+
+		if ($this->is_order_creation_failure($created)) {
+			return array('success' => false, 'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'));
 		}
 
 		if (false === $created || empty($created['clover_order_id'])) {
@@ -824,8 +1071,15 @@ class Clover_API
 
 		$data = $result['data'];
 
-		if (isset($data['paid']) && true !== $data['paid']) {
-			error_log('Clover charge not paid: ' . wp_json_encode($data));
+		if (!isset($data['paid']) || true !== $data['paid']) {
+			error_log(sprintf(
+				'Clover charge not paid: charge_id=%s status=%s amount=%s paid=%s order_id=%s',
+				$data['id'],
+				isset($data['status']) ? $data['status'] : 'unknown',
+				isset($data['amount']) ? $data['amount'] : $amount_cents,
+				isset($data['paid']) ? (true === $data['paid'] ? 'true' : 'false') : 'unset',
+				$clover_order_id
+			));
 			return array(
 				'success' => false,
 				'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'),

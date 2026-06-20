@@ -33,6 +33,26 @@
 		cardZip.mount('#clover-card-zip');
 	}
 
+	function resetCheckoutForm($form) {
+		$form.data('clover-tokenizing', false);
+		$form.removeClass('processing');
+		if ($.fn.unblock) {
+			$form.unblock();
+		}
+	}
+
+	function showCheckoutError($form, message) {
+		$('.woocommerce-NoticeGroup-checkout').remove();
+		$form.prepend(
+			'<div class="woocommerce-NoticeGroup woocommerce-NoticeGroup-checkout">' +
+				'<ul class="woocommerce-error" role="alert">' +
+					'<li>' + message + '</li>' +
+				'</ul>' +
+			'</div>'
+		);
+		$('html, body').animate({ scrollTop: $form.offset().top - 100 }, 300);
+	}
+
 	function ensureTokenAndSubmit($form) {
 		if (isTokenizing) {
 			return false;
@@ -62,12 +82,18 @@
 			tokenField.val('order_only');
 			$form.off('submit.clover_gateway');
 			$form.submit();
-		}).catch(function () {
+		}).catch(function (err) {
 			isTokenizing = false;
-			// Submit as COD/order-only so order still syncs to Clover without charge.
-			tokenField.val('order_only');
-			$form.off('submit.clover_gateway');
-			$form.submit();
+			resetCheckoutForm($form);
+
+			var message = wc_clover_params.error_generic || 'Payment could not be processed. Please try again.';
+			if (err && err.message) {
+				message = err.message;
+			} else if (wc_clover_params.error_invalid) {
+				message = wc_clover_params.error_invalid;
+			}
+
+			showCheckoutError($form, message);
 		});
 
 		return false;

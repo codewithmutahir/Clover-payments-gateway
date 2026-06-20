@@ -273,15 +273,16 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 			$api->fire_order($clover_order_id);
 
 			$order->update_status(
-				'processing',
+				'on-hold',
 				__('COD order placed. Order sent to Clover — payment on pickup/delivery.', 'clover-gateway')
 			);
 			$order->save();
 			$order->add_order_note(
 				sprintf(
-					__('Clover order created (COD, no charge). Clover Order ID: %s | Total: $%s', 'clover-gateway'),
+					/* translators: 1: Clover order ID, 2: formatted order total */
+					__('Clover order created (COD, no charge). Clover Order ID: %1$s | Total: %2$s', 'clover-gateway'),
 					$clover_order_id,
-					number_format($amount_cents / 100, 2)
+					wc_price($amount_cents / 100, array('currency' => $order->get_currency()))
 				)
 			);
 
