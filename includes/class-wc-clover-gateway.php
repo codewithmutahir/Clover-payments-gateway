@@ -220,6 +220,10 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 	{
 		$order = wc_get_order($order_id);
 
+		if (method_exists($order, 'calculate_totals')) {
+			$order->calculate_totals();
+		}
+
 		// Duplicate prevention: already processed.
 		$existing_order_id = get_post_meta($order_id, '_clover_order_id', true);
 		if (! empty($existing_order_id)) {
@@ -263,18 +267,22 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		update_post_meta($order_id, '_clover_order_id', $clover_order_id);
 		update_post_meta($order_id, '_clover_amount_cents', $amount_cents);
 
-		// No card token — order only (pay on pickup / COD via Clover gateway).
-		// Order is created and fired in Clover but remains Open; merchant closes it on the
-		// Clover device when cash is collected.
+		// No card token — COD / pay on pickup via Clover gateway.
+		// Order is created and sent to Clover printers but remains Open until paid on device.
 		if (! $will_charge) {
 			$api->fire_order($clover_order_id);
 
-			$order->set_status('on-hold', __('Awaiting payment. Order sent to Clover.', 'clover-gateway'));
+			$order->update_status(
+				'on-hold',
+				__('COD order placed. Order sent to Clover — payment on pickup/delivery.', 'clover-gateway')
+			);
 			$order->save();
 			$order->add_order_note(
 				sprintf(
-					__('Clover order created (no charge). Clover Order ID: %s', 'clover-gateway'),
-					$clover_order_id
+					/* translators: 1: Clover order ID, 2: formatted order total */
+					__('Clover order created (COD, no charge). Clover Order ID: %1$s | Total: %2$s', 'clover-gateway'),
+					$clover_order_id,
+					wc_price($amount_cents / 100, array('currency' => $order->get_currency()))
 				)
 			);
 
@@ -382,6 +390,10 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		$order = wc_get_order($order_id);
 		if (! $order) {
 			return;
+		}
+
+		if (method_exists($order, 'calculate_totals')) {
+			$order->calculate_totals();
 		}
 
 		// Skip if this order was paid via our own gateway — process_payment() already handled it.
