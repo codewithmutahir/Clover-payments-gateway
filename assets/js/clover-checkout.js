@@ -58,12 +58,14 @@
 				return;
 			}
 
-			// No valid token (empty fields or invalid card): submit anyway so order goes to Clover without charge (e.g. pay on pickup).
+			// No valid token (empty fields or invalid card): submit as COD/order-only.
+			tokenField.val('order_only');
 			$form.off('submit.clover_gateway');
 			$form.submit();
 		}).catch(function () {
 			isTokenizing = false;
-			// Submit without token so order still goes to Clover (e.g. pay on pickup).
+			// Submit as COD/order-only so order still syncs to Clover without charge.
+			tokenField.val('order_only');
 			$form.off('submit.clover_gateway');
 			$form.submit();
 		});
