@@ -8,7 +8,7 @@
 
 Accept credit and debit card payments through Clover, sync WooCommerce orders to Clover POS with real line items, and keep inventory and tax reporting aligned across both systems.
 
-Developed by [Elite Solution USA](https://elitesolutionusa.com).
+Developed by [Codewithmutahir](https://github.com/codewithmutahir).
 
 ---
 
