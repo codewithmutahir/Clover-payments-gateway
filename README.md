@@ -256,7 +256,7 @@ The plugin sends both `taxRates` and computed `taxAmount` on product line items 
 
 When a Default Tax Rate ID is configured:
 
-- Tax is calculated from Clover’s rate format (millionths of a percent, e.g. `87500000` = 8.75%).
+- Tax is calculated from Clover’s stored rate value by dividing by **1,000,000,000** (one billion) to get the decimal rate—for example, `87500000 ÷ 1,000,000,000 = 0.0875` (**8.75%**).
 - Order-level `taxAmount` is derived from product subtotals via `calculate_order_tax_cents()`.
 - A separate WooCommerce “Tax” line item is **not** added (Clover calculates tax from line-item `taxRates`; adding both would double-count).
 - Sequential order creation applies tax metadata only to product lines (shipping and fees are excluded).

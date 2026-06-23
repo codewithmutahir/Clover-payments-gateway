@@ -17,7 +17,8 @@ Clover Payment Gateway for WooCommerce connects your store to Clover so that:
 
 * **Card payments** are processed through Clover (PCI-compliant via Clover iframe).
 * **Orders** are created in Clover with real product names and line items.
-* **COD / pickup orders** and other gateways (COD, BACS) sync to Clover POS automatically.
+* **COD / pickup via Clover gateway** — checkout creates a Clover order immediately (stays Open until paid on device); no card charge.
+* **Other payment methods (COD, BACS, etc.)** — synced by `Clover_Order_Sync` when the order reaches a syncable status (`pending`, `processing`, or `on-hold`), using a DB lock to prevent duplicates.
 * **Tax** is recorded in Clover’s Tax Report when you set a Default Tax Rate ID (no double-counting).
 * **Item Sales** reporting works when products are linked to Clover inventory (manual or via Clover Sync).
 * **Inventory sync** matches WooCommerce products to Clover items by SKU/name and supports bulk export.
