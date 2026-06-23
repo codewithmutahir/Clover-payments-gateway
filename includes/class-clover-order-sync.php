@@ -200,41 +200,77 @@ class Clover_Order_Sync {
 	}
 
 	/**
-	 * Atomically acquire a per-order POS sync lock (object cache + DB fallback).
+	 * Atomically acquire a per-order POS sync lock (DB insert + optional persistent cache).
 	 *
 	 * @param int $order_id Order ID.
 	 * @return bool True when the lock was acquired.
 	 */
 	private function acquire_pos_sync_lock( $order_id ) {
+		global $wpdb;
+
 		$lock_key = 'clover_pos_sync_' . (int) $order_id;
 		$group    = 'clover_pos_sync';
 		$ttl      = 2 * MINUTE_IN_SECONDS;
+		$now      = time();
 
-		if ( false === wp_cache_add( $lock_key, 1, $group, $ttl ) ) {
+		if ( wp_using_ext_object_cache() && false === wp_cache_add( $lock_key, 1, $group, $ttl ) ) {
 			return false;
 		}
 
-		// add_option() fails when option_name already exists (atomic DB insert).
-		if ( false === add_option( $lock_key, time(), '', 'no' ) ) {
-			$locked_at = (int) get_option( $lock_key );
-			if ( $locked_at && ( time() - $locked_at ) < $ttl ) {
-				wp_cache_delete( $lock_key, $group );
-				return false;
-			}
-
-			delete_option( $lock_key );
-			wp_cache_delete( $lock_key, $group );
-
-			if ( false === wp_cache_add( $lock_key, 1, $group, $ttl ) ) {
-				return false;
-			}
-			if ( false === add_option( $lock_key, time(), '', 'no' ) ) {
-				wp_cache_delete( $lock_key, $group );
-				return false;
-			}
+		if ( $this->insert_pos_sync_lock_row( $lock_key, $now ) ) {
+			return true;
 		}
 
-		return true;
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_delete( $lock_key, $group );
+		}
+
+		$locked_at = (int) $wpdb->get_var(
+			$wpdb->prepare(
+				"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+				$lock_key
+			)
+		);
+
+		if ( $locked_at && ( $now - $locked_at ) < $ttl ) {
+			return false;
+		}
+
+		$wpdb->delete( $wpdb->options, array( 'option_name' => $lock_key ), array( '%s' ) );
+
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_delete( $lock_key, $group );
+		}
+
+		if ( $this->insert_pos_sync_lock_row( $lock_key, $now ) ) {
+			if ( wp_using_ext_object_cache() ) {
+				wp_cache_set( $lock_key, 1, $group, $ttl );
+			}
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Insert a lock row; succeeds only when no row exists (UNIQUE option_name).
+	 *
+	 * @param string $lock_key  Option name for the lock.
+	 * @param int    $locked_at Unix timestamp stored as option_value.
+	 * @return bool True when exactly one row was inserted.
+	 */
+	private function insert_pos_sync_lock_row( $lock_key, $locked_at ) {
+		global $wpdb;
+
+		$inserted = $wpdb->query(
+			$wpdb->prepare(
+				"INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %d, 'no')",
+				$lock_key,
+				$locked_at
+			)
+		);
+
+		return 1 === $inserted;
 	}
 
 	/**
@@ -244,9 +280,15 @@ class Clover_Order_Sync {
 	 * @return void
 	 */
 	private function release_pos_sync_lock( $order_id ) {
+		global $wpdb;
+
 		$lock_key = 'clover_pos_sync_' . (int) $order_id;
-		wp_cache_delete( $lock_key, 'clover_pos_sync' );
-		delete_option( $lock_key );
+
+		if ( wp_using_ext_object_cache() ) {
+			wp_cache_delete( $lock_key, 'clover_pos_sync' );
+		}
+
+		$wpdb->delete( $wpdb->options, array( 'option_name' => $lock_key ), array( '%s' ) );
 	}
 
 	/**
