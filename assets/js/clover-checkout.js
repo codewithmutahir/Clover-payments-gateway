@@ -43,9 +43,6 @@
 				boxShadow: 'none',
 				backgroundColor: 'transparent',
 			},
-			'input::placeholder': {
-				color: '#9ca3af',
-			},
 		};
 
 		cardNumber = cloverElements.create('CARD_NUMBER', cloverStyles);
