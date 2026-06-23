@@ -1,6 +1,6 @@
 # Clover Payment Gateway for WooCommerce
 
-[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)](clover-gateway.php)
+[![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)](clover-gateway.php)
 [![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-blue.svg)](https://wordpress.org/)
 [![WooCommerce](https://img.shields.io/badge/WooCommerce-5.0%2B-purple.svg)](https://woocommerce.com/)
 [![PHP](https://img.shields.io/badge/PHP-7.4%2B-777BB4.svg)](https://www.php.net/)
@@ -47,14 +47,16 @@ The plugin also syncs non-card orders (Cash on Delivery, bank transfer, etc.) to
 | Area | Capability |
 |------|------------|
 | **Payments** | Card tokenization via Clover iframe SDK; charges against Clover orders |
-| **Order sync** | Atomic order creation with line items, shipping, and custom fees |
+| **Checkout UI** | Compact hosted card fields (number, expiry, CVC, ZIP) styled to match WooCommerce |
+| **Order sync** | Atomic order creation with line items, shipping, and custom fees; sequential fallback |
 | **COD / pickup** | Orders sent to Clover printers without charging; remain **Open** until paid on device |
-| **Other gateways** | COD, BACS, and other methods sync to Clover on `processing` / `on-hold` |
+| **Other gateways** | COD, BACS, and other methods sync to Clover on `pending`, `processing`, or `on-hold` |
+| **Duplicate prevention** | DB-level sync lock, immediate `_clover_order_id` persistence, idempotent order lookup |
 | **Refunds** | Full and partial refunds from WooCommerce admin via Clover eCommerce API |
 | **Inventory** | Match products by SKU/name, manual linking, bulk export to Clover |
-| **Tax** | Configurable default tax rate ID for Clover Tax Report and receipt attribution |
+| **Tax** | Configurable default tax rate ID; per-line `taxRates` + `taxAmount` for Clover Tax Report |
 | **Reporting** | Item Sales when products are linked to Clover inventory items |
-| **Admin UX** | Credential validation, tax rate browser, item cache refresh, order metabox |
+| **Admin UX** | Credential validation, tax rate browser, item cache refresh, order metabox, manual POS sync |
 | **Licensing** | License key activation with weekly verification |
 
 ---
@@ -126,6 +128,10 @@ Use the built-in admin actions on the gateway settings page:
 
 Ensure the REST token can read inventory/items so product matching and tax assignment work correctly.
 
+### POS sync credentials
+
+Non-card order sync (`Clover_Order_Sync`) uses gateway settings first. If those are empty, it falls back to the official **Clover Payments for WooCommerce** plugin credentials (`woocommerce_clover_payments_settings`), so COD/BACS orders can still reach Clover when only the official plugin is configured.
+
 ---
 
 ## License Activation
@@ -184,6 +190,8 @@ sequenceDiagram
 5. The order is fired to kitchen/register printers.
 6. WooCommerce order status is set to paid; charge and card metadata are stored.
 
+Checkout renders four compact iframe fields (card number, expiry, CVC, ZIP). Placeholders and styling are applied inside the Clover SDK; the plugin does not duplicate labels outside the iframe.
+
 ### COD / pay on pickup (via Clover gateway)
 
 When checkout completes without a card token, the plugin:
@@ -195,12 +203,15 @@ When checkout completes without a card token, the plugin:
 
 ### Other payment methods (COD, BACS, etc.)
 
-Orders paid with a different gateway sync automatically when status becomes `processing` or `on-hold`:
+Orders paid with a different gateway sync automatically when status becomes `pending`, `processing`, or `on-hold`:
 
-- Clover order is created with line items.
-- Order is fired to printers.
-- Clover order ID is saved to prevent duplicate sync.
-- Duplicate sync is also prevented if `process_payment()` already ran.
+- Clover order is created with line items via the same atomic-order API used for card payments.
+- `_clover_order_id` is saved **before** the order is fired to printers.
+- A per-order DB lock prevents duplicate Clover orders when checkout and status hooks run concurrently.
+- The Clover gateway payment method is skipped (it already creates its own Clover order at checkout).
+- Use **Order actions → Send to Clover POS** to force a re-sync when needed.
+
+Duplicate sync is also prevented if `process_payment()` already ran for Clover card orders.
 
 ---
 
@@ -241,7 +252,16 @@ Tax appears correctly in Clover when:
 1. **Default Tax Rate ID** is set on the gateway (use **Browse Tax Rates**).
 2. Products are linked to Clover inventory items with tax rates assigned (via export or Clover dashboard).
 
-The plugin sends both `taxRates` and computed `taxAmount` on line items so Clover’s Tax Report attributes revenue to the named rate—not just receipt totals.
+The plugin sends both `taxRates` and computed `taxAmount` on product line items so Clover’s Tax Report attributes revenue to the named rate—not just receipt totals.
+
+When a Default Tax Rate ID is configured:
+
+- Tax is calculated from Clover’s stored rate value by dividing by **1,000,000,000** (one billion) to get the decimal rate—for example, `87500000 ÷ 1,000,000,000 = 0.0875` (**8.75%**).
+- Order-level `taxAmount` is derived from product subtotals via `calculate_order_tax_cents()`.
+- A separate WooCommerce “Tax” line item is **not** added (Clover calculates tax from line-item `taxRates`; adding both would double-count).
+- Sequential order creation applies tax metadata only to product lines (shipping and fees are excluded).
+
+Without a Default Tax Rate ID, WooCommerce tax totals are sent as a fallback “Tax” line item and order `taxAmount`.
 
 ---
 
@@ -253,6 +273,7 @@ The plugin sends both `taxRates` and computed `taxAmount` on line items so Clove
 | **WooCommerce → Clover License** | License key management |
 | **WooCommerce → Clover Sync** | Inventory export and product linking |
 | **Order edit screen → Clover Payment Details** | Clover Order ID, Charge ID, amount, dashboard link |
+| **Order actions → Send to Clover POS** | Manual re-sync for non-card orders |
 | **Order notes** | Sync and charge events logged automatically |
 
 Card brand and last four digits are shown in admin, customer order view, and WooCommerce PDF Invoices (when that plugin is active).
@@ -270,14 +291,15 @@ clover-gateway/
 ├── includes/
 │   ├── class-wc-clover-gateway.php # WooCommerce payment gateway
 │   ├── class-clover-api.php        # Clover v3 REST + eCommerce API client
+│   ├── class-clover-order-sync.php # COD/BACS and other non-card POS sync
 │   ├── class-clover-admin.php      # Settings UI, order metabox, AJAX tools
 │   ├── class-clover-inventory-sync.php
 │   ├── class-clover-inventory-admin.php
 │   ├── class-clover-license-manager.php
 │   └── class-clover-license-setup.php
 ├── assets/
-│   ├── js/                         # Checkout, admin, inventory scripts
-│   └── css/                        # Admin and checkout styles
+│   ├── js/                         # Checkout (clover-checkout.js), admin, inventory
+│   └── css/                        # Admin and checkout (clover-checkout.css) styles
 └── templates/
     └── payment-form.php            # Clover iframe mount points
 ```
@@ -321,7 +343,9 @@ clover-gateway/
 | Product names wrong in Clover | Item cache stale | **Refresh item cache** on gateway settings |
 | Item Sales report empty | Products not linked | Run Clover Sync; set `_clover_item_id` per product |
 | Tax missing in Tax Report | No Default Tax Rate ID | **Browse Tax Rates** and save the correct ID |
-| Order synced twice | Race between hooks | Plugin saves `_clover_order_id` immediately; check for custom hooks |
+| Tax amount wrong / doubled | Stale config or WC tax line + Clover rate | Set Default Tax Rate ID; upgrade to 1.0.2+ |
+| Order synced twice | Concurrent hooks | Fixed in 1.0.2 via DB lock + meta-before-fire; check custom hooks |
+| Card fields too large at checkout | Theme overrides iframe height | Hard-refresh; ensure `clover-checkout.css` loads |
 | Checkout fails without HTTPS | Clover requires SSL in production | Enable TLS on the site |
 | License features disabled | Weekly verify failed 3× | Re-enter key on **Clover License** screen |
 
@@ -354,11 +378,32 @@ Defined in `clover-gateway.php`:
 | `main` | Production releases |
 | `dev` | Active development |
 
+### Filters
+
+| Filter | Purpose |
+|--------|---------|
+| `clover_gateway_pos_sync_statuses` | WooCommerce statuses that trigger POS sync |
+| `clover_gateway_skip_pos_sync_methods` | Payment methods excluded from generic POS sync |
+| `clover_gateway_should_sync_order` | Include or exclude a specific order |
+| `clover_gateway_link_inventory_items` | Link line items to Clover inventory on checkout |
+| `clover_gateway_print_categories` | Print categories when `/fire` is unavailable |
+
 ---
 
 ## Changelog
 
 See [readme.txt](readme.txt) for the WordPress.org-compatible changelog.
+
+### 1.0.2
+
+- Fix Clover tax divisor (`/ 1_000_000_000`) for line-item and order-level `taxAmount`.
+- Skip WooCommerce “Tax” line item when Default Tax Rate ID is set to prevent double-counting.
+- Use `calculate_order_tax_cents()` in sequential order creation; apply tax only to product lines.
+- Compact checkout card form with Clover SDK styling (no duplicate external labels).
+- Add `Clover_Order_Sync` for non-card orders (COD, BACS, etc.) with official-plugin credential fallback.
+- Prevent duplicate POS sync via atomic DB lock, single status hook, and meta saved before `fire_order`.
+- Manual **Send to Clover POS** order action; sync on `pending`, `processing`, and `on-hold`.
+- Improved API error handling and idempotent order recovery after ambiguous failures.
 
 ### 1.0.1
 
