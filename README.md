@@ -345,6 +345,7 @@ clover-gateway/
 | Tax missing in Tax Report | No Default Tax Rate ID | **Browse Tax Rates** and save the correct ID |
 | Tax amount wrong / doubled | Stale config or WC tax line + Clover rate | Set Default Tax Rate ID; upgrade to 1.0.2+ |
 | Order synced twice | Concurrent hooks | Fixed in 1.0.2 via DB lock + meta-before-fire; check custom hooks |
+| POS shows x1/0 or x1/1 qty | Legacy /fire partial kitchen send | Fixed in 1.0.3+ via print_event; upgrade plugin |
 | Card fields too large at checkout | Theme overrides iframe height | Hard-refresh; ensure `clover-checkout.css` loads |
 | Checkout fails without HTTPS | Clover requires SSL in production | Enable TLS on the site |
 | License features disabled | Weekly verify failed 3× | Re-enter key on **Clover License** screen |

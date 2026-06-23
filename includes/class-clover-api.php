@@ -427,6 +427,43 @@ class Clover_API
 	}
 
 	/**
+	 * Resolve a Clover inventory item ID for a WooCommerce order line item.
+	 *
+	 * Links by default when _clover_item_id meta is set (same as official Clover plugin).
+	 *
+	 * @param WC_Order              $order WooCommerce order.
+	 * @param WC_Order_Item_Product $item  Order line item.
+	 * @return string|null Clover item ID or null.
+	 */
+	protected function resolve_clover_item_id_for_line_item( $order, $item ) {
+		$product_id   = $item->get_product_id();
+		$variation_id = method_exists( $item, 'get_variation_id' ) ? (int) $item->get_variation_id() : 0;
+		$lookup_id    = $variation_id ? $variation_id : $product_id;
+
+		if ( ! $lookup_id ) {
+			return null;
+		}
+
+		$clover_item_id = get_post_meta( $lookup_id, '_clover_item_id', true );
+		if ( empty( $clover_item_id ) && $variation_id && $product_id ) {
+			$clover_item_id = get_post_meta( $product_id, '_clover_item_id', true );
+		}
+
+		if ( empty( $clover_item_id ) || ! is_string( $clover_item_id ) ) {
+			return null;
+		}
+
+		$link = (bool) apply_filters(
+			'clover_gateway_link_inventory_items',
+			true,
+			$order,
+			$item
+		);
+
+		return $link ? trim( $clover_item_id ) : null;
+	}
+
+	/**
 	 * Build atomic-order line items (simpler payload — matches Clover POS expectations).
 	 *
 	 * @param WC_Order $order WooCommerce order.
@@ -448,31 +485,23 @@ class Clover_API
 			$unit_price_cents = (int) round(($total / $quantity) * 100);
 
 			$li = array(
-				'name'    => $item->get_name(),
-				'price'   => $unit_price_cents,
-				'unitQty' => $this->clover_unit_qty($quantity),
+				'name'         => $item->get_name(),
+				'price'        => $unit_price_cents,
+				'unitQty'      => $this->clover_unit_qty( $quantity ),
+				'quantitySold' => (float) $quantity,
+				'printed'      => false,
+				'exchanged'    => false,
 			);
 
-			$product_id   = $item->get_product_id();
-			$variation_id = method_exists($item, 'get_variation_id') ? (int) $item->get_variation_id() : 0;
-			$lookup_id    = $variation_id ? $variation_id : $product_id;
-
-			if ($lookup_id && (bool) apply_filters('clover_gateway_link_inventory_items', false, $order, $item)) {
-				$clover_item_id = get_post_meta($lookup_id, '_clover_item_id', true);
-				if (empty($clover_item_id) && $variation_id && $product_id) {
-					$clover_item_id = get_post_meta($product_id, '_clover_item_id', true);
-				}
-				if (! empty($clover_item_id) && is_string($clover_item_id)) {
-					$li['item'] = array('id' => trim($clover_item_id));
-				}
+			$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
+			if ( $clover_item_id ) {
+				$li['item'] = array( 'id' => $clover_item_id );
 			}
 
 			if ( ! empty( $this->default_tax_rate_id ) ) {
 				$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
 
 				if ( $full_rate && ! empty( $full_rate['rate'] ) && (int) $full_rate['rate'] > 0 ) {
-					// taxAmount per line item = (unit_price * qty * rate) / 10,000,000
-					// Clover stores rates as millionths of a percent (e.g. 8.75% = 87500000)
 					$line_total_cents = $unit_price_cents * $quantity;
 					$li['taxAmount']  = (int) round( $line_total_cents * (int) $full_rate['rate'] / 1000000000 );
 
@@ -502,6 +531,7 @@ class Clover_API
 				'name'    => $shipping_label,
 				'price'   => (int) round($shipping_total * 100),
 				'unitQty' => 1000,
+				'printed' => false,
 			);
 		}
 
@@ -517,6 +547,7 @@ class Clover_API
 				'name'    => $fee_name,
 				'price'   => (int) round($fee_total * 100),
 				'unitQty' => 1000,
+				'printed' => false,
 			);
 		}
 
@@ -530,6 +561,7 @@ class Clover_API
 					'name'    => __( 'Tax', 'clover-gateway' ),
 					'price'   => (int) round( $tax_total * 100 ),
 					'unitQty' => 1000,
+					'printed' => false,
 				);
 			}
 		}
@@ -540,6 +572,7 @@ class Clover_API
 				'name'    => __('Discount', 'clover-gateway'),
 				'price'   => -1 * abs((int) round($discount_total * 100)),
 				'unitQty' => 1000,
+				'printed' => false,
 			);
 		}
 
@@ -568,19 +601,9 @@ class Clover_API
 
 			$unit_price_cents = (int) round(($total / $quantity) * 100);
 
-			$clover_item_id = null;
-			$product_id     = $item->get_product_id();
-			$variation_id   = method_exists($item, 'get_variation_id') ? $item->get_variation_id() : 0;
-			$lookup_id      = $variation_id ? $variation_id : $product_id;
+			$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
 
-			if ($lookup_id) {
-				$clover_item_id = get_post_meta($lookup_id, '_clover_item_id', true);
-				if (empty($clover_item_id) && $variation_id && $product_id) {
-					$clover_item_id = get_post_meta($product_id, '_clover_item_id', true);
-				}
-			}
-
-			if (! empty($clover_item_id) && ! empty($this->default_tax_rate_id)) {
+			if ( ! empty( $clover_item_id ) && ! empty( $this->default_tax_rate_id ) ) {
 				$cache_key = 'clover_itax_' . md5($clover_item_id . '_' . $this->default_tax_rate_id);
 				if (! get_transient($cache_key)) {
 					$assigned = $this->assign_item_tax_rate($clover_item_id, $this->default_tax_rate_id);
@@ -593,14 +616,16 @@ class Clover_API
 			}
 
 			$li = array(
-				'name'    => $item->get_name(),
-				'price'   => $unit_price_cents,
-				'unitQty' => $this->clover_unit_qty($quantity),
-				'printed' => false,
+				'name'         => $item->get_name(),
+				'price'        => $unit_price_cents,
+				'unitQty'      => $this->clover_unit_qty( $quantity ),
+				'quantitySold' => (float) $quantity,
+				'printed'      => false,
+				'exchanged'    => false,
 			);
 
-			if (! empty($clover_item_id) && is_string($clover_item_id)) {
-				$li['item'] = array('id' => trim($clover_item_id));
+			if ( $clover_item_id ) {
+				$li['item'] = array( 'id' => $clover_item_id );
 			}
 
 			if (! empty($this->default_tax_rate_id)) {
@@ -1457,7 +1482,7 @@ class Clover_API
 	public function trigger_clover_print($clover_order_id, $categories = null)
 	{
 		if (null === $categories) {
-			$categories = array('ORDER');
+			$categories = array('ORDER', 'RECEIPT');
 		}
 
 		$any_success = false;
@@ -1498,17 +1523,47 @@ class Clover_API
 	}
 
 	/**
-	 * Fire order to kitchen display / order printer.
+	 * Print order tickets via Clover's documented print_event REST API.
 	 *
-	 * Uses Clover's /fire endpoint only. Calling /fire and print_event together
-	 * produces duplicate tickets (ORDER + RECEIPT). Use the filter below if your
-	 * merchant needs explicit print_event instead.
+	 * Uses POST /print_event (not the undocumented /orders/{id}/fire endpoint).
+	 * The /fire endpoint only marks printer-tagged inventory items as sent, which
+	 * causes x1/0 and x1/1 quantity display on POS and kitchen tickets.
 	 *
 	 * @param string $clover_order_id Clover order ID.
 	 * @return bool
 	 */
 	public function fire_order($clover_order_id)
 	{
+		if (empty($clover_order_id)) {
+			return false;
+		}
+
+		/**
+		 * Print categories for API-created orders.
+		 *
+		 * @param string[] $categories      e.g. array( 'ORDER', 'RECEIPT' ).
+		 * @param string   $clover_order_id Clover order ID.
+		 */
+		$categories = apply_filters('clover_gateway_print_categories', array('ORDER', 'RECEIPT'), $clover_order_id);
+		if (empty($categories)) {
+			return false;
+		}
+
+		if ($this->trigger_clover_print($clover_order_id, $categories)) {
+			return true;
+		}
+
+		/**
+		 * Optional legacy fallback to /fire. Off by default — partial item marking
+		 * produces incorrect x1/0 quantity display on devices and printed tickets.
+		 *
+		 * @param bool   $allow           Whether to call /fire when print_event fails.
+		 * @param string $clover_order_id Clover order ID.
+		 */
+		if (! apply_filters('clover_gateway_allow_fire_endpoint', false, $clover_order_id)) {
+			return false;
+		}
+
 		$fire_result = $this->request_v3(
 			'POST',
 			'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id) . '/fire',
@@ -1516,23 +1571,16 @@ class Clover_API
 		);
 
 		if (! empty($fire_result['success'])) {
+			error_log('Clover: used legacy /fire fallback for order ' . $clover_order_id);
 			return true;
 		}
 
-		error_log('Clover: fire endpoint failed for order ' . $clover_order_id . ' — ' . wp_json_encode(isset($fire_result['data']) ? $fire_result['data'] : $fire_result));
+		error_log(
+			'Clover: print_event and /fire both failed for order ' . $clover_order_id
+				. ' — ' . wp_json_encode(isset($fire_result['data']) ? $fire_result['data'] : $fire_result)
+		);
 
-		/**
-		 * Print categories when /fire is unavailable. Default: kitchen ORDER ticket only.
-		 *
-		 * @param string[] $categories      e.g. array( 'ORDER' ) or array( 'ORDER', 'RECEIPT' ).
-		 * @param string   $clover_order_id Clover order ID.
-		 */
-		$categories = apply_filters('clover_gateway_print_categories', array('ORDER'), $clover_order_id);
-		if (empty($categories)) {
-			return false;
-		}
-
-		return $this->trigger_clover_print($clover_order_id, $categories);
+		return false;
 	}
 
 	/**
