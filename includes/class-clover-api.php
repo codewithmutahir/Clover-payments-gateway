@@ -318,22 +318,25 @@ class Clover_API
 		}
 
 		if ($apply_tax && ! empty($this->default_tax_rate_id)) {
-			$full_rate    = $this->get_tax_rate_by_id($this->default_tax_rate_id);
-			$rate_element = array('id' => $this->default_tax_rate_id);
+			$full_rate = $this->get_tax_rate_by_id($this->default_tax_rate_id);
 
 			if ($full_rate) {
-				$rate_element['name'] = isset($full_rate['name']) ? $full_rate['name'] : '';
-				$rate_element['rate'] = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
+				$rate_val = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
 
-				if ($rate_element['rate'] > 0) {
-					$line_total_cents = (int) round($price_cents * $unit_qty / 1000);
-					$body['taxAmount'] = (int) round($line_total_cents * $rate_element['rate'] / 10000000);
+				if ($rate_val > 0) {
+					$line_total_cents  = (int) round($price_cents * $unit_qty / 1000);
+					$body['taxAmount'] = (int) round($line_total_cents * $rate_val / 1000000000);
 				}
-			}
 
-			$body['taxRates'] = array(
-				'elements' => array($rate_element),
-			);
+				$body['taxRates'] = array(
+					array(
+						'id'        => $this->default_tax_rate_id,
+						'name'      => isset($full_rate['name']) ? $full_rate['name'] : '',
+						'rate'      => isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0,
+						'isDefault' => true,
+					),
+				);
+			}
 		}
 
 		return $body;
@@ -448,7 +451,6 @@ class Clover_API
 				'name'    => $item->get_name(),
 				'price'   => $unit_price_cents,
 				'unitQty' => $this->clover_unit_qty($quantity),
-				'printed' => false,
 			);
 
 			$product_id   = $item->get_product_id();
@@ -462,6 +464,26 @@ class Clover_API
 				}
 				if (! empty($clover_item_id) && is_string($clover_item_id)) {
 					$li['item'] = array('id' => trim($clover_item_id));
+				}
+			}
+
+			if ( ! empty( $this->default_tax_rate_id ) ) {
+				$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
+
+				if ( $full_rate && ! empty( $full_rate['rate'] ) && (int) $full_rate['rate'] > 0 ) {
+					// taxAmount per line item = (unit_price * qty * rate) / 10,000,000
+					// Clover stores rates as millionths of a percent (e.g. 8.75% = 87500000)
+					$line_total_cents = $unit_price_cents * $quantity;
+					$li['taxAmount']  = (int) round( $line_total_cents * (int) $full_rate['rate'] / 1000000000 );
+
+					$li['taxRates'] = array(
+						array(
+							'id'        => $this->default_tax_rate_id,
+							'name'      => isset( $full_rate['name'] ) ? (string) $full_rate['name'] : '',
+							'rate'      => (int) $full_rate['rate'],
+							'isDefault' => true,
+						),
+					);
 				}
 			}
 
@@ -480,7 +502,6 @@ class Clover_API
 				'name'    => $shipping_label,
 				'price'   => (int) round($shipping_total * 100),
 				'unitQty' => 1000,
-				'printed' => false,
 			);
 		}
 
@@ -496,18 +517,21 @@ class Clover_API
 				'name'    => $fee_name,
 				'price'   => (int) round($fee_total * 100),
 				'unitQty' => 1000,
-				'printed' => false,
 			);
 		}
 
-		$tax_total = (float) $order->get_total_tax();
-		if ($tax_total > 0) {
-			$elements[] = array(
-				'name'    => __('Tax', 'clover-gateway'),
-				'price'   => (int) round($tax_total * 100),
-				'unitQty' => 1000,
-				'printed' => false,
-			);
+		// Only add WC tax as a line item when no Clover native tax rate is configured.
+		// When default_tax_rate_id is set, Clover calculates tax from taxRates on each
+		// product line item — adding a separate Tax line item would double-count it.
+		if ( empty( $this->default_tax_rate_id ) ) {
+			$tax_total = (float) $order->get_total_tax();
+			if ( $tax_total > 0 ) {
+				$elements[] = array(
+					'name'    => __( 'Tax', 'clover-gateway' ),
+					'price'   => (int) round( $tax_total * 100 ),
+					'unitQty' => 1000,
+				);
+			}
 		}
 
 		$discount_total = (float) $order->get_discount_total();
@@ -516,7 +540,6 @@ class Clover_API
 				'name'    => __('Discount', 'clover-gateway'),
 				'price'   => -1 * abs((int) round($discount_total * 100)),
 				'unitQty' => 1000,
-				'printed' => false,
 			);
 		}
 
@@ -581,21 +604,24 @@ class Clover_API
 			}
 
 			if (! empty($this->default_tax_rate_id)) {
-				$full_rate    = $this->get_tax_rate_by_id($this->default_tax_rate_id);
-				$rate_element = array('id' => $this->default_tax_rate_id);
+				$full_rate = $this->get_tax_rate_by_id($this->default_tax_rate_id);
 
 				if ($full_rate) {
-					$rate_element['name'] = isset($full_rate['name']) ? $full_rate['name'] : '';
-					$rate_element['rate'] = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
+					$rate_val = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
 
-					if ($rate_element['rate'] > 0) {
-						$li['taxAmount'] = (int) round($unit_price_cents * $quantity * $rate_element['rate'] / 10000000);
+					if ($rate_val > 0) {
+						$li['taxAmount'] = (int) round($unit_price_cents * $quantity * $rate_val / 1000000000);
 					}
-				}
 
-				$li['taxRates'] = array(
-					'elements' => array($rate_element),
-				);
+					$li['taxRates'] = array(
+						array(
+							'id'        => $this->default_tax_rate_id,
+							'name'      => isset( $full_rate['name'] ) ? (string) $full_rate['name'] : '',
+							'rate'      => $rate_val,
+							'isDefault' => true,
+						),
+					);
+				}
 			}
 
 			$li['apply_tax']      = true;
@@ -666,25 +692,28 @@ class Clover_API
 	 * @param WC_Order $order WooCommerce order.
 	 * @return int
 	 */
-	protected function calculate_order_tax_cents($order)
-	{
-		$tax_cents        = 0;
-		$wc_tax_cents     = (int) round((float) $order->get_total_tax() * 100);
-		$clover_full_rate = ! empty($this->default_tax_rate_id) ? $this->get_tax_rate_by_id($this->default_tax_rate_id) : null;
+	protected function calculate_order_tax_cents( $order ) {
+		$wc_tax_cents = (int) round( (float) $order->get_total_tax() * 100 );
 
-		if ($clover_full_rate && isset($clover_full_rate['rate']) && (int) $clover_full_rate['rate'] > 0) {
+		if ( empty( $this->default_tax_rate_id ) ) {
+			return $wc_tax_cents;
+		}
+
+		$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
+
+		if ( $full_rate && isset( $full_rate['rate'] ) && (int) $full_rate['rate'] > 0 ) {
 			$product_subtotal_cents = 0;
-			foreach ($order->get_items() as $_item) {
-				$product_subtotal_cents += (int) round((float) $_item->get_total() * 100);
+			foreach ( $order->get_items() as $_item ) {
+				$product_subtotal_cents += (int) round( (float) $_item->get_total() * 100 );
 			}
-			$tax_cents = (int) round($product_subtotal_cents * (int) $clover_full_rate['rate'] / 10000000);
+			// Clover rate: 87500000 = 8.75% -> divide by 10,000,000
+			$clover_tax_cents = (int) round( $product_subtotal_cents * (int) $full_rate['rate'] / 1000000000 );
+			if ( $clover_tax_cents > 0 ) {
+				return $clover_tax_cents;
+			}
 		}
 
-		if ($tax_cents === 0 && $wc_tax_cents > 0) {
-			$tax_cents = $wc_tax_cents;
-		}
-
-		return $tax_cents;
+		return $wc_tax_cents;
 	}
 
 	/**
@@ -961,18 +990,18 @@ class Clover_API
 			);
 		}
 
-		$tax_cents   = (int) round((float) $order->get_total_tax() * 100);
+		$tax_cents   = $this->calculate_order_tax_cents( $order );
 		$total_cents = (int) round((float) $order->get_total() * 100);
 
 		$payload = array(
-			'state'          => 'open',
-			'title'          => $this->get_order_title($order),
-			'note'           => $this->build_order_note($order),
-			'currency'       => strtoupper($order->get_currency() ?: 'USD'),
-			'total'          => $total_cents,
-			'lineItems'      => $line_data,
-			'testMode'       => (bool) $this->test_mode,
-			'groupLineItems' => true,
+			'state'      => 'open',
+			'title'      => $this->get_order_title($order),
+			'note'       => $this->build_order_note($order),
+			'currency'   => strtoupper($order->get_currency() ?: 'USD'),
+			'total'      => $total_cents,
+			'taxAmount'  => $tax_cents,
+			'lineItems'  => $line_data,
+			'testMode'   => (bool) $this->test_mode,
 		);
 
 		$result = $this->request_v3(
@@ -1002,7 +1031,7 @@ class Clover_API
 			);
 		}
 
-		$tax_cents   = (int) round((float) $order->get_total_tax() * 100);
+		$tax_cents = $this->calculate_order_tax_cents( $order );
 		$total_cents = (int) round((float) $order->get_total() * 100);
 
 		$result = $this->request_v3(
@@ -1012,7 +1041,6 @@ class Clover_API
 				'state'             => 'open',
 				'title'             => $this->get_order_title($order),
 				'manualTransaction' => false,
-				'groupLineItems'    => true,
 				'testMode'          => (bool) $this->test_mode,
 				'note'              => $this->build_order_note($order),
 				'total'             => $total_cents,
@@ -1028,13 +1056,16 @@ class Clover_API
 		$clover_order_id = $parsed['clover_order_id'];
 		$line_item_total = count($line_items);
 
-		foreach ($line_items as $index => $li) {
-			$name    = isset($li['name']) ? $li['name'] : '';
-			$price   = isset($li['price']) ? (int) $li['price'] : 0;
-			$qty     = isset($li['unitQty']) ? (int) $li['unitQty'] : 1000;
-			$item_id = isset($li['item']['id']) ? $li['item']['id'] : null;
+		foreach ( $line_items as $index => $li ) {
+			$name    = isset( $li['name'] )         ? $li['name']         : '';
+			$price   = isset( $li['price'] )        ? (int) $li['price']  : 0;
+			$qty     = isset( $li['unitQty'] )      ? (int) $li['unitQty']: 1000;
+			$item_id = isset( $li['item']['id'] )   ? $li['item']['id']   : null;
+			// Apply tax only for product line items (those that have taxRates set).
+			// Shipping and fee items in the array do not have taxRates.
+			$apply_tax_for_item = ! empty( $li['taxRates'] );
 
-			$added = $this->add_line_item($clover_order_id, $name, $price, $item_id, false, $qty);
+			$added = $this->add_line_item( $clover_order_id, $name, $price, $item_id, $apply_tax_for_item, $qty );
 
 			if (empty($added['success']) || empty($added['id'])) {
 				$api_message = ! empty($added['message']) ? (string) $added['message'] : '';
@@ -1175,10 +1206,15 @@ class Clover_API
 			);
 		}
 
+		$final_tax = isset( $created['tax_cents'] ) ? (int) $created['tax_cents'] : 0;
+		if ( $final_tax > 0 ) {
+			$this->update_order_tax_amount( $created['clover_order_id'], $final_tax );
+		}
+
 		return array(
 			'success'         => true,
 			'clover_order_id' => $created['clover_order_id'],
-			'tax_cents'       => isset($created['tax_cents']) ? $created['tax_cents'] : 0,
+			'tax_cents'       => $final_tax,
 			'total_cents'     => isset($created['total_cents']) ? $created['total_cents'] : 0,
 		);
 	}
@@ -1421,7 +1457,7 @@ class Clover_API
 	public function trigger_clover_print($clover_order_id, $categories = null)
 	{
 		if (null === $categories) {
-			$categories = array('ORDER', 'RECEIPT');
+			$categories = array('ORDER');
 		}
 
 		$any_success = false;
@@ -1462,7 +1498,11 @@ class Clover_API
 	}
 
 	/**
-	 * Fire order to kitchen display and trigger physical printers.
+	 * Fire order to kitchen display / order printer.
+	 *
+	 * Uses Clover's /fire endpoint only. Calling /fire and print_event together
+	 * produces duplicate tickets (ORDER + RECEIPT). Use the filter below if your
+	 * merchant needs explicit print_event instead.
 	 *
 	 * @param string $clover_order_id Clover order ID.
 	 * @return bool
@@ -1475,13 +1515,24 @@ class Clover_API
 			array()
 		);
 
-		if (empty($fire_result['success'])) {
-			error_log('Clover: fire endpoint failed for order ' . $clover_order_id . ' — ' . wp_json_encode(isset($fire_result['data']) ? $fire_result['data'] : $fire_result));
+		if (! empty($fire_result['success'])) {
+			return true;
 		}
 
-		$print_result = $this->trigger_clover_print($clover_order_id);
+		error_log('Clover: fire endpoint failed for order ' . $clover_order_id . ' — ' . wp_json_encode(isset($fire_result['data']) ? $fire_result['data'] : $fire_result));
 
-		return ! empty($fire_result['success']) || $print_result;
+		/**
+		 * Print categories when /fire is unavailable. Default: kitchen ORDER ticket only.
+		 *
+		 * @param string[] $categories      e.g. array( 'ORDER' ) or array( 'ORDER', 'RECEIPT' ).
+		 * @param string   $clover_order_id Clover order ID.
+		 */
+		$categories = apply_filters('clover_gateway_print_categories', array('ORDER'), $clover_order_id);
+		if (empty($categories)) {
+			return false;
+		}
+
+		return $this->trigger_clover_print($clover_order_id, $categories);
 	}
 
 	/**

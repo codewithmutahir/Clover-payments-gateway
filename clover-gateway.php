@@ -6,7 +6,7 @@
  * Requires Plugins: woocommerce
  * Author: Elite Solution USA
  * Author URI: https://elitesolutionusa.com
- * Version: 1.0.1
+ * Version: 1.0.2
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Text Domain: clover-gateway
@@ -114,7 +114,7 @@ class Clover_Gateway_Plugin {
 	 */
 	protected function define_constants() {
 		if ( ! defined( 'WC_CLOVER_GATEWAY_VERSION' ) ) {
-			define( 'WC_CLOVER_GATEWAY_VERSION', '1.0.1' );
+			define( 'WC_CLOVER_GATEWAY_VERSION', '1.0.2' );
 		}
 
 		if ( ! defined( 'WC_CLOVER_GATEWAY_PLUGIN_FILE' ) ) {

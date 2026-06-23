@@ -40,9 +40,8 @@ class Clover_Order_Sync {
 	 * Constructor.
 	 */
 	private function __construct() {
+		// Single hook: checkout also triggers status_changed; a second checkout hook caused duplicate Clover orders/prints.
 		add_action( 'woocommerce_order_status_changed', array( $this, 'on_status_changed' ), 10, 3 );
-		add_action( 'woocommerce_checkout_order_processed', array( $this, 'on_checkout_processed' ), 25, 3 );
-		add_action( 'woocommerce_store_api_checkout_order_processed', array( $this, 'on_store_api_checkout' ), 25, 1 );
 		add_filter( 'woocommerce_order_actions', array( $this, 'register_order_action' ), 10, 2 );
 		// WC runs: do_action( 'woocommerce_order_action_' . sanitize_title( $key ), $order ).
 		add_action(
@@ -92,38 +91,6 @@ class Clover_Order_Sync {
 			return;
 		}
 		$this->sync_order( (int) $order_id );
-	}
-
-	/**
-	 * @param int      $order_id    Order ID.
-	 * @param array    $posted_data Posted checkout data.
-	 * @param WC_Order $order       Order object.
-	 * @return void
-	 */
-	public function on_checkout_processed( $order_id, $posted_data, $order ) {
-		unset( $posted_data );
-		if ( ! $order instanceof WC_Order ) {
-			$order = wc_get_order( $order_id );
-		}
-		if ( ! $order ) {
-			return;
-		}
-		if ( ! in_array( $order->get_status(), $this->syncable_statuses(), true ) ) {
-			return;
-		}
-		$this->sync_order( (int) $order->get_id() );
-	}
-
-	/**
-	 * Block checkout compatibility.
-	 *
-	 * @param WC_Order $order Order.
-	 * @return void
-	 */
-	public function on_store_api_checkout( $order ) {
-		if ( $order instanceof WC_Order ) {
-			$this->on_checkout_processed( $order->get_id(), array(), $order );
-		}
 	}
 
 	/**
@@ -253,7 +220,18 @@ class Clover_Order_Sync {
 			return true;
 		}
 
+		$lock_key = 'clover_pos_sync_' . (int) $order_id;
+		if ( ! $force && get_transient( $lock_key ) ) {
+			return true;
+		}
+		if ( ! $force ) {
+			set_transient( $lock_key, 1, 2 * MINUTE_IN_SECONDS );
+		}
+
 		if ( ! $this->should_sync_order( $order ) ) {
+			if ( ! $force ) {
+				delete_transient( $lock_key );
+			}
 			$this->add_sync_note(
 				$order,
 				sprintf(
@@ -267,6 +245,9 @@ class Clover_Order_Sync {
 
 		$creds = self::get_sync_credentials();
 		if ( ! $creds ) {
+			if ( ! $force ) {
+				delete_transient( $lock_key );
+			}
 			$this->add_sync_note(
 				$order,
 				__( 'Clover POS sync skipped: add Merchant ID + API token under WooCommerce → Settings → Payments → Clover Payments, or configure the official Clover plugin keys.', 'clover-gateway' )
@@ -289,6 +270,9 @@ class Clover_Order_Sync {
 
 		$result = $api->create_order_with_items( $order );
 		if ( empty( $result['success'] ) ) {
+			if ( ! $force ) {
+				delete_transient( $lock_key );
+			}
 			$message = ! empty( $result['message'] ) ? (string) $result['message'] : __( 'Unknown Clover API error.', 'clover-gateway' );
 			$env     = ! empty( $creds['test_mode'] )
 				? __( 'sandbox', 'clover-gateway' )
@@ -310,11 +294,12 @@ class Clover_Order_Sync {
 		$clover_order_id = (string) $result['clover_order_id'];
 		$amount_cents    = (int) round( (float) $order->get_total() * 100 );
 
-		$api->fire_order( $clover_order_id );
-
+		// Persist before fire so a parallel status/checkout hook cannot create a second Clover order.
 		$order->update_meta_data( '_clover_order_id', $clover_order_id );
 		$order->update_meta_data( '_clover_amount_cents', $amount_cents );
 		$order->save();
+
+		$api->fire_order( $clover_order_id );
 
 		$env = ! empty( $creds['test_mode'] )
 			? __( 'sandbox Clover', 'clover-gateway' )
@@ -332,6 +317,10 @@ class Clover_Order_Sync {
 		);
 
 		error_log( 'Clover Sync: order #' . $order_id . ' synced as ' . $clover_order_id );
+
+		if ( ! $force ) {
+			delete_transient( $lock_key );
+		}
 
 		return true;
 	}

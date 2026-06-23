@@ -22,10 +22,36 @@
 		});
 
 		cloverElements = cloverInstance.elements();
-		cardNumber = cloverElements.create('CARD_NUMBER');
-		cardDate = cloverElements.create('CARD_DATE');
-		cardCvv = cloverElements.create('CARD_CVV');
-		cardZip = cloverElements.create('CARD_POSTAL_CODE');
+
+		var cloverStyles = {
+			body: {
+				fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+				fontSize: '14px',
+				margin: '0',
+				padding: '0',
+			},
+			label: {
+				display: 'none',
+			},
+			input: {
+				fontSize: '14px',
+				padding: '0',
+				margin: '0',
+				height: '24px',
+				lineHeight: '24px',
+				border: 'none',
+				boxShadow: 'none',
+				backgroundColor: 'transparent',
+			},
+			'input::placeholder': {
+				color: '#9ca3af',
+			},
+		};
+
+		cardNumber = cloverElements.create('CARD_NUMBER', cloverStyles);
+		cardDate = cloverElements.create('CARD_DATE', cloverStyles);
+		cardCvv = cloverElements.create('CARD_CVV', cloverStyles);
+		cardZip = cloverElements.create('CARD_POSTAL_CODE', cloverStyles);
 
 		cardNumber.mount('#clover-card-number');
 		cardDate.mount('#clover-card-date');

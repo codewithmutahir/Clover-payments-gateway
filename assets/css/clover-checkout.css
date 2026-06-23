@@ -5,51 +5,51 @@
  */
 
 #wc-clover_gateway-cc-form {
-	margin-top: 12px;
+	margin-top: 8px;
+}
+
+#wc-clover_gateway-cc-form.wc-credit-card-form {
+	background: transparent;
+	padding: 0;
+	border: 0;
 }
 
 .clover-card-fields {
 	display: grid;
 	grid-template-columns: 1fr 1fr;
-	grid-gap: 14px;
-	margin-top: 12px;
+	gap: 10px;
+	margin-top: 8px;
 }
 
-.clover-card-field {
-	border: 1px solid #ddd;
-	border-radius: 6px;
-	padding: 8px 12px;
+.clover-card-field-element {
+	box-sizing: border-box;
+	height: 40px;
+	min-height: 40px;
+	max-height: 40px;
+	padding: 0 12px;
+	border: 1px solid #d1d5db;
+	border-radius: 4px;
 	background: #fff;
-	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+	overflow: hidden;
+	display: flex;
+	align-items: center;
 	transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.clover-card-field:focus-within {
+.clover-card-field-element:focus-within {
 	border-color: #2563eb;
 	box-shadow: 0 0 0 1px #2563eb;
 }
 
-.clover-card-field-label {
-	display: block;
-	font-size: 13px;
-	font-weight: 500;
-	color: #1e1e1e;
-	margin-bottom: 6px;
-}
-
-.clover-card-field-element {
-	height: 42px;
-	min-height: 42px;
-	max-height: 42px;
-	overflow: hidden;
-	display: flex;
-	align-items: center;
-}
-
 .clover-card-field-element iframe {
-	height: 42px !important;
-	min-height: 42px !important;
-	max-height: 42px !important;
+	display: block;
+	width: 100% !important;
+	height: 38px !important;
+	min-height: 38px !important;
+	max-height: 38px !important;
+	border: 0 !important;
+	margin: 0 !important;
+	padding: 0 !important;
 }
 
 .clover-card-row-full {
@@ -60,5 +60,8 @@
 	.clover-card-fields {
 		grid-template-columns: 1fr;
 	}
-}
 
+	.clover-card-row-full {
+		grid-column: auto;
+	}
+}
