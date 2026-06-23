@@ -200,6 +200,56 @@ class Clover_Order_Sync {
 	}
 
 	/**
+	 * Atomically acquire a per-order POS sync lock (object cache + DB fallback).
+	 *
+	 * @param int $order_id Order ID.
+	 * @return bool True when the lock was acquired.
+	 */
+	private function acquire_pos_sync_lock( $order_id ) {
+		$lock_key = 'clover_pos_sync_' . (int) $order_id;
+		$group    = 'clover_pos_sync';
+		$ttl      = 2 * MINUTE_IN_SECONDS;
+
+		if ( false === wp_cache_add( $lock_key, 1, $group, $ttl ) ) {
+			return false;
+		}
+
+		// add_option() fails when option_name already exists (atomic DB insert).
+		if ( false === add_option( $lock_key, time(), '', 'no' ) ) {
+			$locked_at = (int) get_option( $lock_key );
+			if ( $locked_at && ( time() - $locked_at ) < $ttl ) {
+				wp_cache_delete( $lock_key, $group );
+				return false;
+			}
+
+			delete_option( $lock_key );
+			wp_cache_delete( $lock_key, $group );
+
+			if ( false === wp_cache_add( $lock_key, 1, $group, $ttl ) ) {
+				return false;
+			}
+			if ( false === add_option( $lock_key, time(), '', 'no' ) ) {
+				wp_cache_delete( $lock_key, $group );
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Release a per-order POS sync lock.
+	 *
+	 * @param int $order_id Order ID.
+	 * @return void
+	 */
+	private function release_pos_sync_lock( $order_id ) {
+		$lock_key = 'clover_pos_sync_' . (int) $order_id;
+		wp_cache_delete( $lock_key, 'clover_pos_sync' );
+		delete_option( $lock_key );
+	}
+
+	/**
 	 * Create the Clover POS order and fire printers.
 	 *
 	 * @param int  $order_id Order ID.
@@ -220,17 +270,13 @@ class Clover_Order_Sync {
 			return true;
 		}
 
-		$lock_key = 'clover_pos_sync_' . (int) $order_id;
-		if ( ! $force && get_transient( $lock_key ) ) {
+		if ( ! $force && ! $this->acquire_pos_sync_lock( $order_id ) ) {
 			return true;
-		}
-		if ( ! $force ) {
-			set_transient( $lock_key, 1, 2 * MINUTE_IN_SECONDS );
 		}
 
 		if ( ! $this->should_sync_order( $order ) ) {
 			if ( ! $force ) {
-				delete_transient( $lock_key );
+				$this->release_pos_sync_lock( $order_id );
 			}
 			$this->add_sync_note(
 				$order,
@@ -246,7 +292,7 @@ class Clover_Order_Sync {
 		$creds = self::get_sync_credentials();
 		if ( ! $creds ) {
 			if ( ! $force ) {
-				delete_transient( $lock_key );
+				$this->release_pos_sync_lock( $order_id );
 			}
 			$this->add_sync_note(
 				$order,
@@ -271,7 +317,7 @@ class Clover_Order_Sync {
 		$result = $api->create_order_with_items( $order );
 		if ( empty( $result['success'] ) ) {
 			if ( ! $force ) {
-				delete_transient( $lock_key );
+				$this->release_pos_sync_lock( $order_id );
 			}
 			$message = ! empty( $result['message'] ) ? (string) $result['message'] : __( 'Unknown Clover API error.', 'clover-gateway' );
 			$env     = ! empty( $creds['test_mode'] )
@@ -319,7 +365,7 @@ class Clover_Order_Sync {
 		error_log( 'Clover Sync: order #' . $order_id . ' synced as ' . $clover_order_id );
 
 		if ( ! $force ) {
-			delete_transient( $lock_key );
+			$this->release_pos_sync_lock( $order_id );
 		}
 
 		return true;
