@@ -267,7 +267,7 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		// No card token — COD / pay on pickup via Clover gateway.
 		// Order is created and sent to Clover printers but remains Open until paid on device.
 		if (! $will_charge) {
-			$api->fire_order($clover_order_id);
+			$api->fire_order( $clover_order_id, $order->get_id() );
 
 			$order->update_status(
 				'on-hold',
@@ -313,7 +313,7 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		$card_last4 = isset($charge['card_last4']) ? $charge['card_last4'] : '';
 
 		// Step 3: Fire order to kitchen/printer (best-effort — non-fatal).
-		$api->fire_order($clover_order_id);
+		$api->fire_order( $clover_order_id, $order->get_id() );
 
 		// Step 4: Mark WooCommerce order as paid.
 		$order->payment_complete($charge_id);

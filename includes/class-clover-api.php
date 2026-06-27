@@ -32,6 +32,22 @@ class Clover_API
 	 */
 	protected $cached_tax_rates = null;
 
+	/**
+	 * Log to both WooCommerce logger (visible in WC > Status > Logs > clover-gateway)
+	 * and PHP error_log when WP_DEBUG_LOG is enabled.
+	 *
+	 * @param string $message Log message.
+	 * @param string $level   WC log level: debug, info, notice, warning, error, critical.
+	 */
+	private function log( $message, $level = 'debug' ) {
+		if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+			error_log( '[Clover Gateway] ' . $message );
+		}
+		if ( function_exists( 'wc_get_logger' ) ) {
+			wc_get_logger()->log( $level, $message, array( 'source' => 'clover-gateway' ) );
+		}
+	}
+
 	public function __construct($merchant_id, $api_token, $public_key, $private_key, $test_mode = false, $default_tax_rate_id = '')
 	{
 		$this->merchant_id         = $merchant_id;
@@ -116,7 +132,7 @@ class Clover_API
 		$response = wp_remote_request($url, $args);
 
 		if (is_wp_error($response)) {
-			error_log('Clover v3 API error: ' . $response->get_error_message());
+			$this->log('v3 API error: ' . $response->get_error_message(), 'error');
 			return array(
 				'success'   => false,
 				'ambiguous' => true,
@@ -129,7 +145,7 @@ class Clover_API
 		$body = json_decode(wp_remote_retrieve_body($response), true);
 
 		if ($code < 200 || $code >= 300) {
-			error_log('Clover v3 API HTTP ' . $code . ': ' . wp_json_encode($body));
+			$this->log('v3 API HTTP ' . $code . ': ' . wp_json_encode($body), 'error');
 			$ambiguous = ($code >= 500 || in_array((int) $code, array(408, 429), true));
 			$payload   = array(
 				'success'   => false,
@@ -166,7 +182,7 @@ class Clover_API
 		$response = wp_remote_request($url, $args);
 
 		if (is_wp_error($response)) {
-			error_log('Clover eCommerce API error: ' . $response->get_error_message());
+			$this->log('eCommerce API error: ' . $response->get_error_message(), 'error');
 			return array('success' => false, 'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'));
 		}
 
@@ -174,7 +190,7 @@ class Clover_API
 		$body = json_decode(wp_remote_retrieve_body($response), true);
 
 		if ($code < 200 || $code >= 300) {
-			error_log('Clover eCommerce API HTTP ' . $code . ': ' . wp_json_encode($body));
+			$this->log('eCommerce API HTTP ' . $code . ': ' . wp_json_encode($body), 'error');
 			return array('success' => false, 'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'), 'data' => $body);
 		}
 
@@ -278,9 +294,10 @@ class Clover_API
 			}
 		}
 
-		error_log(
-			'Clover: Failed to add line item "' . $name . '" to order ' . $clover_order_id
-				. ' — ' . wp_json_encode(isset($last_result['data']) ? $last_result['data'] : $last_result)
+		$this->log(
+			'Failed to add line item "' . $name . '" to order ' . $clover_order_id
+				. ' — ' . wp_json_encode(isset($last_result['data']) ? $last_result['data'] : $last_result),
+			'error'
 		);
 
 		return array(
@@ -394,11 +411,12 @@ class Clover_API
 		);
 
 		if (empty($r1['success']) && empty($r2['success'])) {
-			error_log(
-				'Clover: Both tax-rate paths failed for line item ' . $line_item_id
+			$this->log(
+				'Both tax-rate paths failed for line item ' . $line_item_id
 					. ' on order ' . $clover_order_id
 					. ' | path1=' . wp_json_encode(isset($r1['data']) ? $r1['data'] : $r1)
-					. ' | path2=' . wp_json_encode(isset($r2['data']) ? $r2['data'] : $r2)
+					. ' | path2=' . wp_json_encode(isset($r2['data']) ? $r2['data'] : $r2),
+				'error'
 			);
 		}
 	}
@@ -427,6 +445,20 @@ class Clover_API
 	}
 
 	/**
+	 * Whether a WooCommerce line item should be linked to a Clover inventory item.
+	 *
+	 * Returns true only when _clover_item_id meta is set AND the
+	 * clover_gateway_link_inventory_items filter allows it.
+	 *
+	 * @param WC_Order              $order WooCommerce order.
+	 * @param WC_Order_Item_Product $item  Order line item.
+	 * @return bool
+	 */
+	protected function clover_should_link_inventory( $order, $item ) {
+		return null !== $this->resolve_clover_item_id_for_line_item( $order, $item );
+	}
+
+	/**
 	 * Resolve a Clover inventory item ID for a WooCommerce order line item.
 	 *
 	 * Links by default when _clover_item_id meta is set (same as official Clover plugin).
@@ -445,11 +477,20 @@ class Clover_API
 		}
 
 		$clover_item_id = get_post_meta( $lookup_id, '_clover_item_id', true );
-		if ( empty( $clover_item_id ) && $variation_id && $product_id ) {
-			$clover_item_id = get_post_meta( $product_id, '_clover_item_id', true );
+		if ( is_string( $clover_item_id ) ) {
+			$clover_item_id = trim( $clover_item_id );
+		} else {
+			$clover_item_id = '';
 		}
 
-		if ( empty( $clover_item_id ) || ! is_string( $clover_item_id ) ) {
+		if ( '' === $clover_item_id && $variation_id && $product_id ) {
+			$parent_id = get_post_meta( $product_id, '_clover_item_id', true );
+			if ( is_string( $parent_id ) ) {
+				$clover_item_id = trim( $parent_id );
+			}
+		}
+
+		if ( '' === $clover_item_id ) {
 			return null;
 		}
 
@@ -460,7 +501,7 @@ class Clover_API
 			$item
 		);
 
-		return $link ? trim( $clover_item_id ) : null;
+		return $link ? $clover_item_id : null;
 	}
 
 	/**
@@ -484,6 +525,9 @@ class Clover_API
 
 			$unit_price_cents = (int) round(($total / $quantity) * 100);
 
+			$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
+			$linked = null !== $clover_item_id;
+
 			$li = array(
 				'name'         => $item->get_name(),
 				'price'        => $unit_price_cents,
@@ -493,10 +537,17 @@ class Clover_API
 				'exchanged'    => false,
 			);
 
-			$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
-			if ( $clover_item_id ) {
+			if ( $linked ) {
 				$li['item'] = array( 'id' => $clover_item_id );
 			}
+
+			$this->log(
+				'Item [' . $item->get_name() . ']: '
+				. ( $linked
+					? 'inventory-linked id=' . $clover_item_id
+					: 'ad-hoc unitQty=' . $this->clover_unit_qty( $quantity ) )
+				. ' qty=' . $quantity
+			);
 
 			if ( ! empty( $this->default_tax_rate_id ) ) {
 				$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
@@ -615,6 +666,8 @@ class Clover_API
 				}
 			}
 
+			$linked = null !== $clover_item_id;
+
 			$li = array(
 				'name'         => $item->get_name(),
 				'price'        => $unit_price_cents,
@@ -624,9 +677,17 @@ class Clover_API
 				'exchanged'    => false,
 			);
 
-			if ( $clover_item_id ) {
+			if ( $linked ) {
 				$li['item'] = array( 'id' => $clover_item_id );
 			}
+
+			$this->log(
+				'Item [' . $item->get_name() . ']: '
+				. ( $linked
+					? 'inventory-linked id=' . $clover_item_id
+					: 'ad-hoc unitQty=' . $this->clover_unit_qty( $quantity ) )
+				. ' qty=' . $quantity
+			);
 
 			if (! empty($this->default_tax_rate_id)) {
 				$full_rate = $this->get_tax_rate_by_id($this->default_tax_rate_id);
@@ -929,11 +990,11 @@ class Clover_API
 		);
 
 		if (empty($result['success'])) {
-			error_log('Clover: Failed to delete orphaned order ' . $clover_order_id . ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result));
+			$this->log('Failed to delete orphaned order ' . $clover_order_id . ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result), 'error');
 			return false;
 		}
 
-		error_log('Clover: Deleted orphaned order ' . $clover_order_id);
+		$this->log('Deleted orphaned order ' . $clover_order_id);
 		return true;
 	}
 
@@ -957,17 +1018,19 @@ class Clover_API
 			);
 		}
 
-		error_log(
-			'Clover: order creation failed for WC order #' . $order->get_order_number()
-				. ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result)
+		$this->log(
+			'Order creation failed for WC order #' . $order->get_order_number()
+				. ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result),
+			'error'
 		);
 
 		if ($this->is_ambiguous_api_failure($result)) {
 			$existing = $this->lookup_existing_clover_order($order, $expected_line_count);
 			if ($existing && ! empty($existing['id'])) {
-				error_log(
-					'Clover: Recovered existing order ' . $existing['id']
-						. ' after ambiguous failure for WC order #' . $order->get_order_number()
+				$this->log(
+					'Recovered existing order ' . $existing['id']
+						. ' after ambiguous failure for WC order #' . $order->get_order_number(),
+					'warning'
 				);
 				return array(
 					'clover_order_id' => $existing['id'],
@@ -1008,7 +1071,7 @@ class Clover_API
 		$line_items = $line_data['elements'];
 
 		if (empty($line_items)) {
-			error_log('Clover: No line items to sync for WC order #' . $order->get_order_number());
+			$this->log('No line items to sync for WC order #' . $order->get_order_number(), 'error');
 			return array(
 				'failure' => 'deterministic',
 				'message' => __('No line items could be mapped for Clover.', 'clover-gateway'),
@@ -1094,9 +1157,10 @@ class Clover_API
 
 			if (empty($added['success']) || empty($added['id'])) {
 				$api_message = ! empty($added['message']) ? (string) $added['message'] : '';
-				error_log(
-					'Clover: Sequential line item failed for "' . $name . '" on order ' . $clover_order_id
-						. ($api_message ? ' — ' . $api_message : '')
+				$this->log(
+					'Sequential line item failed for "' . $name . '" on order ' . $clover_order_id
+						. ($api_message ? ' — ' . $api_message : ''),
+					'error'
 				);
 
 				$existing = $this->lookup_existing_clover_order($order, $line_item_total);
@@ -1173,7 +1237,7 @@ class Clover_API
 		);
 
 		if (empty($result['success'])) {
-			error_log('Clover: Failed to set total on order ' . $clover_order_id . ' — ' . wp_json_encode($result));
+			$this->log('Failed to set total on order ' . $clover_order_id . ' — ' . wp_json_encode($result), 'error');
 			return false;
 		}
 
@@ -1203,10 +1267,11 @@ class Clover_API
 
 		if ($this->is_order_creation_failure($created)) {
 			$atomic_failure = $created;
-			error_log(
-				'Clover: Atomic order creation failed for WC order #' . $order->get_order_number()
+			$this->log(
+				'Atomic order creation failed for WC order #' . $order->get_order_number()
 					. ' — falling back to sequential. '
-					. (isset($created['message']) ? $created['message'] : '')
+					. (isset($created['message']) ? $created['message'] : ''),
+				'warning'
 			);
 			$created = $this->create_order_sequential($order);
 		}
@@ -1266,7 +1331,7 @@ class Clover_API
 		);
 
 		if (empty($result['success'])) {
-			error_log('Clover: Failed to set taxAmount on order ' . $clover_order_id . ' — ' . wp_json_encode($result));
+			$this->log('Failed to set taxAmount on order ' . $clover_order_id . ' — ' . wp_json_encode($result), 'error');
 			return false;
 		}
 
@@ -1360,7 +1425,7 @@ class Clover_API
 					$message = __('Your card was declined. Please try another card.', 'clover-gateway');
 				}
 			} elseif (! empty($result['data']['error']['message'])) {
-				error_log('Clover charge error: ' . $result['data']['error']['message']);
+				$this->log('Charge error: ' . $result['data']['error']['message'], 'error');
 			}
 
 			return array('success' => false, 'message' => $message);
@@ -1369,14 +1434,14 @@ class Clover_API
 		$data = $result['data'];
 
 		if (!isset($data['paid']) || true !== $data['paid']) {
-			error_log(sprintf(
-				'Clover charge not paid: charge_id=%s status=%s amount=%s paid=%s order_id=%s',
+			$this->log(sprintf(
+				'Charge not paid: charge_id=%s status=%s amount=%s paid=%s order_id=%s',
 				$data['id'],
 				isset($data['status']) ? $data['status'] : 'unknown',
 				isset($data['amount']) ? $data['amount'] : $amount_cents,
 				isset($data['paid']) ? (true === $data['paid'] ? 'true' : 'false') : 'unset',
 				$clover_order_id
-			));
+			), 'error');
 			return array(
 				'success' => false,
 				'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'),
@@ -1449,8 +1514,8 @@ class Clover_API
 			$card_brand = ucwords(strtolower($card_brand));
 		}
 
-		error_log(sprintf(
-			'Clover charge success: charge_id=%s payment_id=%s brand=%s last4=%s tender=%s order_id=%s',
+		$this->log(sprintf(
+			'Charge success: charge_id=%s payment_id=%s brand=%s last4=%s tender=%s order_id=%s',
 			$data['id'],
 			$payment_id,
 			$card_brand,
@@ -1473,114 +1538,87 @@ class Clover_API
 	}
 
 	/**
-	 * Trigger physical printer via Clover print_event API.
-	 *
-	 * @param string $clover_order_id Clover order ID.
-	 * @param array  $categories      Print categories (ORDER, RECEIPT, LABEL).
-	 * @return bool True if at least one print event succeeded.
-	 */
-	public function trigger_clover_print($clover_order_id, $categories = null)
-	{
-		if (null === $categories) {
-			$categories = array('ORDER', 'RECEIPT');
-		}
-
-		$any_success = false;
-
-		foreach ($categories as $category) {
-			$result = $this->request_v3(
-				'POST',
-				'/merchants/' . rawurlencode($this->merchant_id) . '/print_event',
-				array(
-					'orderRef' => array('id' => $clover_order_id),
-					'category' => $category,
-				)
-			);
-
-			if (! empty($result['success']) && ! empty($result['data']['id'])) {
-				$any_success = true;
-				error_log(
-					sprintf(
-						'Clover Print: event %s | category=%s | state=%s | order=%s',
-						$result['data']['id'],
-						$category,
-						isset($result['data']['state']) ? $result['data']['state'] : 'unknown',
-						$clover_order_id
-					)
-				);
-			} else {
-				error_log(
-					'Clover Print: failed for order ' . $clover_order_id
-						. ' category ' . $category
-						. ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result)
-				);
-			}
-
-			usleep(300000);
-		}
-
-		return $any_success;
-	}
-
-	/**
 	 * Print order tickets via Clover's documented print_event REST API.
 	 *
-	 * Uses POST /print_event (not the undocumented /orders/{id}/fire endpoint).
-	 * The /fire endpoint only marks printer-tagged inventory items as sent, which
-	 * causes x1/0 and x1/1 quantity display on POS and kitchen tickets.
+	 * Sends one print_event per category (ORDER, RECEIPT) with a 300 ms gap.
+	 * Records per-category print timestamps as order meta and adds a WC order
+	 * note when any category fails so the merchant has visibility.
 	 *
-	 * @param string $clover_order_id Clover order ID.
-	 * @return bool
+	 * @param string   $clover_order_id Clover order ID.
+	 * @param int|null $wc_order_id     WooCommerce order ID (for notes + meta).
+	 * @return bool True if at least one category printed.
 	 */
-	public function fire_order($clover_order_id)
-	{
-		if (empty($clover_order_id)) {
+	public function fire_order( $clover_order_id, $wc_order_id = null ) {
+		if ( empty( $clover_order_id ) ) {
 			return false;
 		}
 
 		/**
 		 * Print categories for API-created orders.
 		 *
-		 * @param string[] $categories      e.g. array( 'ORDER', 'RECEIPT' ).
-		 * @param string   $clover_order_id Clover order ID.
+		 * @param string[] $categories e.g. array( 'ORDER', 'RECEIPT' ).
 		 */
-		$categories = apply_filters('clover_gateway_print_categories', array('ORDER', 'RECEIPT'), $clover_order_id);
-		if (empty($categories)) {
+		$categories = apply_filters( 'clover_gateway_print_categories', array( 'ORDER', 'RECEIPT' ) );
+		if ( empty( $categories ) ) {
 			return false;
 		}
 
-		if ($this->trigger_clover_print($clover_order_id, $categories)) {
-			return true;
+		$any_success       = false;
+		$failed_categories = array();
+
+		foreach ( $categories as $category ) {
+			usleep( 300000 );
+
+			$result = $this->request_v3(
+				'POST',
+				'/merchants/' . rawurlencode( $this->merchant_id ) . '/print_event',
+				array(
+					'orderRef' => array( 'id' => $clover_order_id ),
+					'category' => $category,
+				)
+			);
+
+			if ( ! empty( $result['success'] ) && ! empty( $result['data']['id'] ) ) {
+				$any_success = true;
+				$this->log( sprintf(
+					'Print: SUCCESS order=%s category=%s event=%s',
+					$clover_order_id,
+					$category,
+					$result['data']['id']
+				) );
+
+				if ( $wc_order_id ) {
+					update_post_meta( $wc_order_id, '_clover_print_fired_' . strtolower( $category ), current_time( 'mysql' ) );
+				}
+			} else {
+				$failed_categories[] = $category;
+				$this->log( sprintf(
+					'Print: FAILED order=%s category=%s — %s',
+					$clover_order_id,
+					$category,
+					wp_json_encode( isset( $result['data'] ) ? $result['data'] : $result )
+				), 'error' );
+			}
 		}
 
-		/**
-		 * Optional legacy fallback to /fire. Off by default — partial item marking
-		 * produces incorrect x1/0 quantity display on devices and printed tickets.
-		 *
-		 * @param bool   $allow           Whether to call /fire when print_event fails.
-		 * @param string $clover_order_id Clover order ID.
-		 */
-		if (! apply_filters('clover_gateway_allow_fire_endpoint', false, $clover_order_id)) {
-			return false;
+		if ( ! empty( $failed_categories ) && $wc_order_id ) {
+			$wc_order = wc_get_order( $wc_order_id );
+			if ( $wc_order ) {
+				$cats_string = implode( ', ', $failed_categories );
+				$wc_order->add_order_note(
+					sprintf(
+						'Clover print failed for: %1$s. Clover order ID: %2$s. Ensure your Clover device is online. <a href="#" class="clover-retry-print" data-order-id="%3$d">Retry print</a>',
+						esc_html( $cats_string ),
+						esc_html( $clover_order_id ),
+						$wc_order_id
+					),
+					false,
+					false
+				);
+			}
 		}
 
-		$fire_result = $this->request_v3(
-			'POST',
-			'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id) . '/fire',
-			array()
-		);
-
-		if (! empty($fire_result['success'])) {
-			error_log('Clover: used legacy /fire fallback for order ' . $clover_order_id);
-			return true;
-		}
-
-		error_log(
-			'Clover: print_event and /fire both failed for order ' . $clover_order_id
-				. ' — ' . wp_json_encode(isset($fire_result['data']) ? $fire_result['data'] : $fire_result)
-		);
-
-		return false;
+		return $any_success;
 	}
 
 	/**
@@ -1606,7 +1644,7 @@ class Clover_API
 			return array();
 		}
 
-		$this->cached_tax_rates = $result['data']['elements'];
+		$this->cached_tax_rates = (array) $result['data']['elements'];
 		return $this->cached_tax_rates;
 	}
 
@@ -1651,7 +1689,7 @@ class Clover_API
 			return true;
 		}
 
-		error_log('Clover: Failed to assign tax rate ' . $tax_rate_id . ' to item ' . $item_id . ' — ' . wp_json_encode($result));
+		$this->log('Failed to assign tax rate ' . $tax_rate_id . ' to item ' . $item_id . ' — ' . wp_json_encode($result), 'error');
 		return false;
 	}
 
@@ -1670,7 +1708,7 @@ class Clover_API
 		);
 
 		if (! $result['success'] || empty($result['data']['elements'])) {
-			error_log('Clover: Could not fetch tenders for merchant ' . $this->merchant_id);
+			$this->log('Could not fetch tenders for merchant ' . $this->merchant_id, 'error');
 			return null;
 		}
 
@@ -1680,7 +1718,7 @@ class Clover_API
 			}
 		}
 
-		error_log('Clover: Cash tender not found in merchant tenders list');
+		$this->log('Cash tender not found in merchant tenders list', 'warning');
 		return null;
 	}
 
@@ -1723,7 +1761,7 @@ class Clover_API
 			return true;
 		}
 
-		error_log('Clover: Failed to add cash tender to order ' . $clover_order_id . ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result));
+		$this->log('Failed to add cash tender to order ' . $clover_order_id . ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result), 'error');
 		return false;
 	}
 

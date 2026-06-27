@@ -41,6 +41,8 @@ class Clover_Admin {
 		add_action( 'wp_ajax_clover_validate_credentials', array( $this, 'ajax_validate_credentials' ) );
 		add_action( 'wp_ajax_clover_refresh_item_cache', array( $this, 'ajax_refresh_item_cache' ) );
 		add_action( 'wp_ajax_clover_load_tax_rates', array( $this, 'ajax_load_tax_rates' ) );
+		add_action( 'wp_ajax_clover_retry_print', array( $this, 'ajax_retry_print' ) );
+		add_action( 'admin_footer', array( $this, 'retry_print_inline_script' ) );
 
 		// Product field: Clover Item ID — links line items to Clover inventory so they appear in Reporting > Revenue Item Sales.
 		add_action( 'woocommerce_product_options_general_product_data', array( $this, 'product_field_clover_item_id' ) );
@@ -125,6 +127,7 @@ class Clover_Admin {
 		if ( $clover_order_id ) {
 			$dashboard_url = 'https://www.clover.com/m/' . rawurlencode( $clover_order_id );
 			echo '<p><a href="' . esc_url( $dashboard_url ) . '" target="_blank" rel="noopener noreferrer">' . esc_html__( 'View in Clover', 'clover-gateway' ) . '</a></p>';
+			echo '<p><button type="button" class="button clover-retry-print" data-order-id="' . esc_attr( (string) $order_id ) . '">' . esc_html__( 'Retry print', 'clover-gateway' ) . '</button></p>';
 		}
 	}
 
@@ -352,6 +355,75 @@ class Clover_Admin {
 		}
 
 		wp_send_json_success( array( 'rates' => $clean ) );
+	}
+
+	/**
+	 * AJAX: Retry Clover print for an order.
+	 */
+	public function ajax_retry_print() {
+		check_ajax_referer( 'clover_retry_print_nonce', 'nonce' );
+
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_send_json_error( 'Unauthorized' );
+		}
+
+		$wc_order_id     = absint( $_POST['order_id'] );
+		$wc_order        = wc_get_order( $wc_order_id );
+		$clover_order_id = $wc_order ? get_post_meta( $wc_order_id, '_clover_order_id', true ) : null;
+
+		if ( ! $clover_order_id ) {
+			wp_send_json_error( 'No Clover order ID found for this WC order.' );
+		}
+
+		$settings = get_option( 'woocommerce_clover_gateway_settings', array() );
+		$api = new Clover_API(
+			isset( $settings['merchant_id'] )     ? $settings['merchant_id']     : '',
+			isset( $settings['api_token'] )        ? $settings['api_token']        : '',
+			isset( $settings['ecomm_public_key'] ) ? $settings['ecomm_public_key'] : '',
+			isset( $settings['ecomm_private_key'] )? $settings['ecomm_private_key']: '',
+			( isset( $settings['test_mode'] ) && 'yes' === $settings['test_mode'] ),
+			isset( $settings['tax_rate_id'] )      ? $settings['tax_rate_id']      : ''
+		);
+
+		$result = $api->fire_order( $clover_order_id, $wc_order_id );
+
+		if ( $result ) {
+			$wc_order->add_order_note( 'Clover print retried successfully.' );
+			wp_send_json_success( 'Print fired successfully.' );
+		} else {
+			wp_send_json_error( 'Print retry failed. Check Clover device is online.' );
+		}
+	}
+
+	/**
+	 * Output inline JS on WC order admin pages for the retry-print link.
+	 */
+	public function retry_print_inline_script() {
+		$screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
+		if ( ! $screen ) {
+			return;
+		}
+		if ( 'woocommerce_page_wc-orders' !== $screen->id && 'shop_order' !== $screen->id ) {
+			return;
+		}
+		$nonce = wp_create_nonce( 'clover_retry_print_nonce' );
+		?>
+		<script>
+		jQuery(document).on('click', '.clover-retry-print', function(e) {
+			e.preventDefault();
+			var $link = jQuery(this), orderId = $link.data('order-id');
+			$link.text('Retrying...');
+			jQuery.post(ajaxurl, {
+				action: 'clover_retry_print',
+				order_id: orderId,
+				nonce: '<?php echo esc_js( $nonce ); ?>'
+			}, function(res) {
+				alert(res.success ? res.data : ('Error: ' + res.data));
+				location.reload();
+			});
+		});
+		</script>
+		<?php
 	}
 }
 
