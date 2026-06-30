@@ -1,6 +1,25 @@
 *** Clover Payment Gateway for WooCommerce Changelog ***
 
-2026-06-28 - version 1.0.3
+2026-07-01 - version 1.0.7
+* Fix - Root cause of 1/1 on kitchen tickets: never send unitQty; expand each unit into its own ad-hoc line item (qty 2 = two lines). Enable Clover Setup → Group line items to merge on print.
+* Add - Post-sync audit logs order note if Clover still attaches catalog inventory or unitQty.
+
+2026-07-01 - version 1.0.6
+* Fix - Remove "2 x Item" quantity-in-name hack; use unitQty + unit price for qty>1 so kitchen prints "2 Tuesday Deal" not "1  2 x Tuesday Deal".
+* Fix - qty=1 lines still omit unitQty and use kitchen-safe name (catalog match break only).
+
+2026-07-01 - version 1.0.5
+* Fix - Root cause of x1/1 / 1/1: Clover POS matches line item names to catalog inventory (kitchen fire fraction display). Break matching with kitchen-safe ad-hoc names; never send unitQty or item.id.
+* Fix - Use custom order + line_items API as primary path (atomic_order is fallback only).
+* Fix - Debug panel flags when Clover still links a catalog item (expand=lineItems.item).
+
+2026-07-01 - version 1.0.4
+* Fix - Kitchen/POS "1/1" quantity display by omitting unitQty for qty-1 fixed-price line items (Clover treats unitQty as PER_UNIT fractional weight).
+* Fix - Always use ad-hoc line items for WooCommerce order sync to avoid PER_UNIT inventory items showing fraction quantities.
+* Fix - Remove unitQty from shipping, fee, tax, and discount line items.
+
+2026-07-01 - version 1.0.3
+* Fix - Kitchen print "1/1" prefix by removing quantitySold, printed, exchanged fields from line items (matching official plugin).
 * Fix - Clover POS quantity display (x1/0, x1/4) by using ad-hoc line items on sequential sync and invalid _clover_item_id fallback.
 * Fix - Kitchen printing via print_event instead of legacy /fire endpoint.
 * Add - Optional Order Debug Panel on WooCommerce orders (settings checkbox; also shown when WP_DEBUG is on).

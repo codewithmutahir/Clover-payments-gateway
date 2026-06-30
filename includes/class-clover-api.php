@@ -238,13 +238,12 @@ class Clover_API
 	 * @param bool        $apply_tax        When true, embeds the configured default tax rate into the
 	 *                                      line item creation payload so Clover records it in the Tax Report.
 	 *                                      Pass false for shipping/fees to avoid taxing non-product lines.
-	 * @param int         $unit_qty         Quantity in Clover milli-units (qty 4 => 4000).
+	 * @param int         $quantity         WooCommerce quantity.
 	 *
 	 * @return array{success:bool,id?:string,message?:string}
 	 */
-	protected function add_line_item( $clover_order_id, $name, $price_cents, $apply_tax = false, $unit_qty = 1000 ) {
-		$unit_qty = max( 1000, (int) $unit_qty );
-		$quantity = (int) $unit_qty / 1000;
+	protected function add_line_item( $clover_order_id, $name, $price_cents, $apply_tax = false, $quantity = 1 ) {
+		$quantity = max( 1, (int) $quantity );
 
 		$this->log(
 			'Sequential add_line_item: ' . $name
@@ -266,7 +265,7 @@ class Clover_API
 			$body = $this->build_line_item_request_body(
 				$name,
 				(int) $price_cents,
-				$unit_qty,
+				$quantity,
 				$attempt['apply_tax']
 			);
 
@@ -299,24 +298,106 @@ class Clover_API
 	}
 
 	/**
+	 * Add a pre-built ad-hoc line item payload (used by sequential sync).
+	 *
+	 * @param string               $clover_order_id Clover order ID.
+	 * @param array<string,mixed>  $li              Sanitized line item body.
+	 * @return array{success:bool,id?:string,message?:string}
+	 */
+	protected function add_line_item_from_payload( $clover_order_id, array $li ) {
+		$clean = $this->sanitize_line_items_for_api( array( $li ) );
+		$body  = isset( $clean[0] ) ? $clean[0] : array();
+
+		if ( empty( $body['name'] ) ) {
+			return array(
+				'success' => false,
+				'message' => __( 'Line item name is required.', 'clover-gateway' ),
+			);
+		}
+
+		$this->log(
+			'Sequential add_line_item payload: ' . wp_json_encode( $body )
+		);
+
+		$result = $this->request_v3(
+			'POST',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/orders/' . rawurlencode( $clover_order_id ) . '/line_items',
+			$body
+		);
+
+		if ( ! empty( $result['success'] ) && ! empty( $result['data']['id'] ) ) {
+			return array(
+				'success' => true,
+				'id'      => (string) $result['data']['id'],
+			);
+		}
+
+		return array(
+			'success' => false,
+			'message' => $this->api_error_message( $result ),
+		);
+	}
+
+	/**
+	 * Log if Clover attached catalog inventory or unitQty after sync (causes 1/1 prints).
+	 *
+	 * @param string   $clover_order_id Clover order ID.
+	 * @param WC_Order $order           WooCommerce order.
+	 * @return void
+	 */
+	protected function audit_clover_line_items_after_sync( $clover_order_id, $order ) {
+		$fetch = $this->fetch_order_with_line_items( $clover_order_id );
+		if ( empty( $fetch['success'] ) || empty( $fetch['order']['lineItems']['elements'] ) ) {
+			return;
+		}
+
+		foreach ( $fetch['order']['lineItems']['elements'] as $li ) {
+			$name = isset( $li['name'] ) ? (string) $li['name'] : '';
+			$issues = array();
+
+			if ( ! empty( $li['item']['id'] ) ) {
+				$issues[] = 'catalog-linked id=' . $li['item']['id'];
+			}
+			if ( isset( $li['unitQty'] ) && (int) $li['unitQty'] > 0 ) {
+				$issues[] = 'unitQty=' . (int) $li['unitQty'];
+			}
+
+			if ( ! empty( $issues ) ) {
+				$this->log(
+					'POST-SYNC AUDIT [' . $name . ']: ' . implode( ', ', $issues )
+					. ' — this causes 1/1 kitchen display',
+					'error'
+				);
+				$order->add_order_note(
+					sprintf(
+						/* translators: 1: item name, 2: issue details */
+						__( 'Clover line "%1$s" has %2$s — kitchen may show 1/1. Check Clover catalog name match or Group Line Items setting.', 'clover-gateway' ),
+						$name,
+						implode( ', ', $issues )
+					)
+				);
+			}
+		}
+
+		$order->save();
+	}
+
+	/**
 	 * Build the POST body for a single Clover order line item.
 	 *
 	 * @param string      $name         Line item name.
 	 * @param int         $price_cents  Unit price in cents.
-	 * @param int         $unit_qty     Quantity in Clover milli-units.
+	 * @param int         $quantity     WooCommerce quantity (unitQty omitted when 1).
 	 * @param bool        $apply_tax    Whether to embed default tax metadata.
 	 * @return array<string,mixed>
 	 */
-	protected function build_line_item_request_body( $name, $price_cents, $unit_qty, $apply_tax = false ) {
-		$quantity_sold = (float) ( (int) $unit_qty / 1000 );
+	protected function build_line_item_request_body( $name, $price_cents, $quantity, $apply_tax = false ) {
+		$quantity = max( 1, (int) $quantity );
 
+		// Never send unitQty — kitchen printers render it as a "N/N" quantity prefix.
 		$body = array(
-			'name'         => $name,
-			'price'        => (int) $price_cents,
-			'unitQty'      => (int) $unit_qty,
-			'quantitySold' => $quantity_sold,
-			'printed'      => false,
-			'exchanged'    => false,
+			'name'  => $name,
+			'price' => (int) $price_cents,
 		);
 
 		if ($apply_tax && ! empty($this->default_tax_rate_id)) {
@@ -326,8 +407,8 @@ class Clover_API
 				$rate_val = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
 
 				if ($rate_val > 0) {
-					$line_total_cents  = (int) round($price_cents * $unit_qty / 1000);
-					$body['taxAmount'] = (int) round($line_total_cents * $rate_val / 1000000000);
+					$line_total_cents  = (int) $price_cents * $quantity;
+					$body['taxAmount'] = (int) round( $line_total_cents * $rate_val / 1000000000 );
 				}
 
 				$body['taxRates'] = array(
@@ -419,14 +500,90 @@ class Clover_API
 	}
 
 	/**
-	 * Clover line-item quantity in milli-units (qty 1 => 1000).
+	 * Build a kitchen-safe ad-hoc line item name.
 	 *
-	 * @param int $quantity Human-readable quantity.
-	 * @return int
+	 * Clover POS auto-matches line item names to catalog inventory. When "Tuesday Deal"
+	 * matches a kitchen-tracked inventory item, POS shows x1/1 (fired/total) instead of x1.
+	 * An invisible zero-width character breaks exact matching without changing the ticket.
+	 *
+	 * @param string $name     WooCommerce product name.
+	 * @param int    $quantity Line quantity.
+	 * @return string
 	 */
-	protected function clover_unit_qty($quantity)
-	{
-		return max(1000, (int) $quantity * 1000);
+	protected function clover_kitchen_line_name( $name, $quantity ) {
+		$name = (string) $name;
+
+		if ( '' === $name ) {
+			return $name;
+		}
+
+		// Zero-width non-joiner (U+200C) after first character — invisible on printers.
+		if ( function_exists( 'mb_substr' ) ) {
+			$name = mb_substr( $name, 0, 1 ) . "\u{200C}" . mb_substr( $name, 1 );
+		} else {
+			$name = substr( $name, 0, 1 ) . "\u{200C}" . substr( $name, 1 );
+		}
+
+		return apply_filters( 'clover_gateway_kitchen_line_name', $name, $quantity );
+	}
+
+	/**
+	 * Build ad-hoc Clover line items for one WooCommerce product row.
+	 *
+	 * Kitchen printers render unitQty as a "N/N" prefix (e.g. 1/1, 2/2). The only
+	 * reliable fix is one API line item per unit: name + unit price, never unitQty.
+	 * Clover's "Group line items" setting (Setup → Order Receipts) merges duplicates
+	 * into a single "2 Item Name" row on the ticket.
+	 *
+	 * @param WC_Order_Item_Product $item             Order line item.
+	 * @param int                   $quantity         Quantity.
+	 * @param int                   $unit_price_cents Per-unit price in cents.
+	 * @param int                   $line_total_cents Full line total in cents.
+	 * @return array<int,array<string,mixed>>
+	 */
+	protected function build_adhoc_product_line_items( $item, $quantity, $unit_price_cents, $line_total_cents ) {
+		$quantity = max( 1, (int) $quantity );
+		$lines    = array();
+		$name     = $this->clover_kitchen_line_name( $item->get_name(), 1 );
+
+		$line_tax_cents = 0;
+		$tax_rates      = array();
+
+		if ( ! empty( $this->default_tax_rate_id ) ) {
+			$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
+
+			if ( $full_rate && ! empty( $full_rate['rate'] ) && (int) $full_rate['rate'] > 0 ) {
+				$line_tax_cents = (int) round( $line_total_cents * (int) $full_rate['rate'] / 1000000000 );
+				$tax_rates      = array(
+					array(
+						'id'        => $this->default_tax_rate_id,
+						'name'      => isset( $full_rate['name'] ) ? (string) $full_rate['name'] : '',
+						'rate'      => (int) $full_rate['rate'],
+						'isDefault' => true,
+					),
+				);
+			}
+		}
+
+		$unit_tax_cents = $quantity > 0 ? (int) floor( $line_tax_cents / $quantity ) : 0;
+		$tax_remainder  = $line_tax_cents - ( $unit_tax_cents * $quantity );
+
+		for ( $u = 0; $u < $quantity; $u++ ) {
+			$li = array(
+				'name'  => $name,
+				'price' => (int) $unit_price_cents,
+			);
+
+			if ( ! empty( $tax_rates ) && $line_tax_cents > 0 ) {
+				$this_unit_tax   = $unit_tax_cents + ( $u < $tax_remainder ? 1 : 0 );
+				$li['taxAmount'] = $this_unit_tax;
+				$li['taxRates']  = $tax_rates;
+			}
+
+			$lines[] = $li;
+		}
+
+		return $lines;
 	}
 
 	/**
@@ -485,7 +642,7 @@ class Clover_API
 
 		$link = (bool) apply_filters(
 			'clover_gateway_link_inventory_items',
-			true,
+			false,
 			$order,
 			$item
 		);
@@ -650,64 +807,20 @@ class Clover_API
 				continue;
 			}
 
-			$unit_price_cents = (int) round(($total / $quantity) * 100);
+			$line_total_cents = (int) round( $total * 100 );
+			$unit_price_cents = (int) round( ( $total / $quantity ) * 100 );
+			$product_lines    = $this->build_adhoc_product_line_items( $item, $quantity, $unit_price_cents, $line_total_cents );
 
-			$clover_item_id = null;
-			$linked         = false;
-
-			if ( ! $force_adhoc ) {
-				$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
-				$linked         = null !== $clover_item_id;
-			}
-
-			$li = array(
-				'name'         => $item->get_name(),
-				'price'        => $unit_price_cents,
-				'unitQty'      => $this->clover_unit_qty( $quantity ),
-				'quantitySold' => (float) $quantity,
-				'printed'      => false,
-				'exchanged'    => false,
+			$this->log(
+				'Item [' . $item->get_name() . ']: ' . count( $product_lines ) . ' ad-hoc unit line(s)'
+				. ' wc_qty=' . $quantity
+				. ' unit_price_cents=' . $unit_price_cents
+				. ' (no unitQty — prevents 1/1 print prefix)'
 			);
 
-			if ( $linked ) {
-				$li['item'] = array( 'id' => $clover_item_id );
+			foreach ( $product_lines as $product_line ) {
+				$elements[] = $product_line;
 			}
-
-			if ( $force_adhoc ) {
-				$this->log(
-					'Item [' . $item->get_name() . ']: FORCED ad-hoc unitQty='
-					. $this->clover_unit_qty( $quantity )
-					. ' qty=' . $quantity
-				);
-			} elseif ( $linked ) {
-				$this->log(
-					'Item [' . $item->get_name() . ']: inventory-linked id=' . $clover_item_id . ' qty=' . $quantity
-				);
-			} else {
-				$this->log(
-					'Item [' . $item->get_name() . ']: ad-hoc unitQty=' . $this->clover_unit_qty( $quantity ) . ' qty=' . $quantity
-				);
-			}
-
-			if ( ! empty( $this->default_tax_rate_id ) ) {
-				$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
-
-				if ( $full_rate && ! empty( $full_rate['rate'] ) && (int) $full_rate['rate'] > 0 ) {
-					$line_total_cents = $unit_price_cents * $quantity;
-					$li['taxAmount']  = (int) round( $line_total_cents * (int) $full_rate['rate'] / 1000000000 );
-
-					$li['taxRates'] = array(
-						array(
-							'id'        => $this->default_tax_rate_id,
-							'name'      => isset( $full_rate['name'] ) ? (string) $full_rate['name'] : '',
-							'rate'      => (int) $full_rate['rate'],
-							'isDefault' => true,
-						),
-					);
-				}
-			}
-
-			$elements[] = $li;
 		}
 
 		$shipping_total = (float) $order->get_shipping_total();
@@ -719,10 +832,8 @@ class Clover_API
 			}
 
 			$elements[] = array(
-				'name'    => $shipping_label,
-				'price'   => (int) round($shipping_total * 100),
-				'unitQty' => 1000,
-				'printed' => false,
+				'name'  => $shipping_label,
+				'price' => (int) round($shipping_total * 100),
 			);
 		}
 
@@ -735,10 +846,8 @@ class Clover_API
 			}
 
 			$elements[] = array(
-				'name'    => $fee_name,
-				'price'   => (int) round($fee_total * 100),
-				'unitQty' => 1000,
-				'printed' => false,
+				'name'  => $fee_name,
+				'price' => (int) round($fee_total * 100),
 			);
 		}
 
@@ -749,10 +858,8 @@ class Clover_API
 			$tax_total = (float) $order->get_total_tax();
 			if ( $tax_total > 0 ) {
 				$elements[] = array(
-					'name'    => __( 'Tax', 'clover-gateway' ),
-					'price'   => (int) round( $tax_total * 100 ),
-					'unitQty' => 1000,
-					'printed' => false,
+					'name'  => __( 'Tax', 'clover-gateway' ),
+					'price' => (int) round( $tax_total * 100 ),
 				);
 			}
 		}
@@ -760,10 +867,8 @@ class Clover_API
 		$discount_total = (float) $order->get_discount_total();
 		if ($discount_total > 0) {
 			$elements[] = array(
-				'name'    => __('Discount', 'clover-gateway'),
-				'price'   => -1 * abs((int) round($discount_total * 100)),
-				'unitQty' => 1000,
-				'printed' => false,
+				'name'  => __('Discount', 'clover-gateway'),
+				'price' => -1 * abs((int) round($discount_total * 100)),
 			);
 		}
 
@@ -780,118 +885,10 @@ class Clover_API
 	 */
 	protected function build_line_items_from_order($order)
 	{
-		$elements = array();
-
-		foreach ($order->get_items() as $item) {
-			$quantity = (int) $item->get_quantity();
-			$total    = (float) $item->get_total();
-
-			if ($quantity <= 0) {
-				continue;
-			}
-
-			$unit_price_cents = (int) round(($total / $quantity) * 100);
-
-			$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
-
-			if ( ! empty( $clover_item_id ) && ! empty( $this->default_tax_rate_id ) ) {
-				$cache_key = 'clover_itax_' . md5($clover_item_id . '_' . $this->default_tax_rate_id);
-				if (! get_transient($cache_key)) {
-					$assigned = $this->assign_item_tax_rate($clover_item_id, $this->default_tax_rate_id);
-					set_transient(
-						$cache_key,
-						$assigned ? 'ok' : 'attempted',
-						$assigned ? 7 * DAY_IN_SECONDS : HOUR_IN_SECONDS
-					);
-				}
-			}
-
-			$linked = null !== $clover_item_id;
-
-			$li = array(
-				'name'         => $item->get_name(),
-				'price'        => $unit_price_cents,
-				'unitQty'      => $this->clover_unit_qty( $quantity ),
-				'quantitySold' => (float) $quantity,
-				'printed'      => false,
-				'exchanged'    => false,
-			);
-
-			if ( $linked ) {
-				$li['item'] = array( 'id' => $clover_item_id );
-			}
-
-			$this->log(
-				'[sequential] Line item: ' . $item->get_name()
-				. ' | qty=' . $quantity
-				. ' | unitQty=' . $this->clover_unit_qty( $quantity )
-				. ' | quantitySold=' . (float) $quantity
-				. ' | price_cents=' . $unit_price_cents
-				. ( $linked ? ' | linked=' . $clover_item_id : ' | ad-hoc' )
-			);
-
-			if (! empty($this->default_tax_rate_id)) {
-				$full_rate = $this->get_tax_rate_by_id($this->default_tax_rate_id);
-
-				if ($full_rate) {
-					$rate_val = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
-
-					if ($rate_val > 0) {
-						$li['taxAmount'] = (int) round($unit_price_cents * $quantity * $rate_val / 1000000000);
-					}
-
-					$li['taxRates'] = array(
-						array(
-							'id'        => $this->default_tax_rate_id,
-							'name'      => isset( $full_rate['name'] ) ? (string) $full_rate['name'] : '',
-							'rate'      => $rate_val,
-							'isDefault' => true,
-						),
-					);
-				}
-			}
-
-			$li['apply_tax']      = true;
-			$li['clover_item_id'] = $clover_item_id;
-			$elements[]           = $li;
-		}
-
-		$shipping_total = (float) $order->get_shipping_total();
-		if ($shipping_total > 0) {
-			$shipping_label  = __('Shipping', 'clover-gateway');
-			$shipping_method = $order->get_shipping_method();
-			if ($shipping_method) {
-				$shipping_label = sprintf(__('Shipping: %s', 'clover-gateway'), $shipping_method);
-			}
-
-			$elements[] = array(
-				'name'      => $shipping_label,
-				'price'     => (int) round($shipping_total * 100),
-				'unitQty'   => 1000,
-				'printed'   => false,
-				'apply_tax' => false,
-			);
-		}
-
-		foreach ($order->get_fees() as $fee) {
-			$fee_total = (float) $fee->get_total();
-			$fee_name  = $fee->get_name();
-
-			if (abs($fee_total) <= 0 || stripos($fee_name, 'tax') !== false) {
-				continue;
-			}
-
-			$elements[] = array(
-				'name'      => $fee_name,
-				'price'     => (int) round($fee_total * 100),
-				'unitQty'   => 1000,
-				'printed'   => false,
-				'apply_tax' => false,
-			);
-		}
+		$data = $this->build_atomic_line_items( $order, true );
 
 		return array(
-			'elements' => $elements,
+			'elements' => isset( $data['elements'] ) ? $data['elements'] : array(),
 		);
 	}
 
@@ -906,7 +903,17 @@ class Clover_API
 		$clean = array();
 
 		foreach ($line_items as $li) {
-			unset($li['apply_tax'], $li['clover_item_id']);
+			unset(
+				$li['apply_tax'],
+				$li['clover_item_id'],
+				$li['item'],
+				$li['unitQty'],
+				$li['quantitySold'],
+				$li['printed'],
+				$li['exchanged'],
+				$li['itemCode'],
+				$li['alternateName']
+			);
 			$clean[] = $li;
 		}
 
@@ -1201,79 +1208,20 @@ class Clover_API
 	}
 
 	/**
-	 * Create Clover order via atomic_order API (preferred — single call with all line items).
+	 * Create Clover order via custom order + line_items API (primary path).
 	 *
-	 * @param WC_Order $order WooCommerce order.
-	 * @return array|false Result array on success, false on failure.
-	 */
-	protected function create_atomic_order($order)
-	{
-		$line_data  = $this->build_atomic_line_items($order);
-		$line_items = $line_data['elements'];
-
-		if (empty($line_items)) {
-			$this->log('No line items to sync for WC order #' . $order->get_order_number(), 'error');
-			return array(
-				'failure' => 'deterministic',
-				'message' => __('No line items could be mapped for Clover.', 'clover-gateway'),
-			);
-		}
-
-		$tax_cents   = $this->calculate_order_tax_cents( $order );
-		$total_cents = (int) round((float) $order->get_total() * 100);
-
-		$payload = array(
-			'state'      => 'open',
-			'title'      => $this->get_order_title($order),
-			'note'       => $this->build_order_note($order),
-			'currency'   => strtoupper($order->get_currency() ?: 'USD'),
-			'total'      => $total_cents,
-			'taxAmount'  => $tax_cents,
-			'lineItems'  => $line_data,
-			'testMode'   => (bool) $this->test_mode,
-		);
-
-		$result = $this->request_v3(
-			'POST',
-			'/merchants/' . rawurlencode($this->merchant_id) . '/atomic_order/orders',
-			$payload
-		);
-
-		if (
-			empty( $result['success'] )
-			&& $this->should_fallback_atomic_to_adhoc( $result, $line_items )
-		) {
-			$this->log(
-				'Atomic order failed due to invalid inventory links for WC order #'
-				. $order->get_order_number()
-				. ' — retrying all line items as ad-hoc',
-				'warning'
-			);
-
-			$line_data            = $this->build_atomic_line_items( $order, true );
-			$payload['lineItems'] = $line_data;
-
-			$result = $this->request_v3(
-				'POST',
-				'/merchants/' . rawurlencode( $this->merchant_id ) . '/atomic_order/orders',
-				$payload
-			);
-		}
-
-		return $this->parse_order_create_api_result($order, $result, $tax_cents, $total_cents, count($line_items));
-	}
-
-	/**
-	 * Fallback: create Clover order shell then add line items sequentially.
+	 * Avoids atomic_order, which can attach catalog inventory by product name and
+	 * cause kitchen/POS to show x1/1 fire-fraction display instead of plain quantity.
 	 *
 	 * @param WC_Order $order WooCommerce order.
 	 * @return array|false Result array on success, false on failure.
 	 */
 	protected function create_order_sequential($order)
 	{
-		// Sequential fallback must never link inventory — ad-hoc line items only.
+		// Custom order + line_items API only — avoids atomic_order catalog matching.
 		$line_data  = $this->build_atomic_line_items( $order, true );
-		$line_items = $line_data['elements'];
+		$line_items = $this->sanitize_line_items_for_api( $line_data['elements'] );
+		$line_data  = array( 'elements' => $line_items );
 
 		if (empty($line_items)) {
 			return array(
@@ -1308,22 +1256,13 @@ class Clover_API
 		$line_item_total = count($line_items);
 
 		foreach ( $line_items as $index => $li ) {
-			$name    = isset( $li['name'] )         ? $li['name']         : '';
-			$price   = isset( $li['price'] )        ? (int) $li['price']  : 0;
-			$qty     = isset( $li['unitQty'] )      ? (int) $li['unitQty']: 1000;
-			$quantity = isset( $li['quantitySold'] ) ? (float) $li['quantitySold'] : ( (int) $qty / 1000 );
-			// Apply tax only for product line items (those that have taxRates set).
-			// Shipping and fee items in the array do not have taxRates.
+			$name  = isset( $li['name'] ) ? $li['name'] : '';
+			$price = isset( $li['price'] ) ? (int) $li['price'] : 0;
 			$apply_tax_for_item = ! empty( $li['taxRates'] );
 
-			$this->log(
-				'Sequential line item: ' . $name
-				. ' qty=' . $quantity
-				. ' unitQty=' . (int) $qty
-				. ' quantitySold=' . (float) $quantity
-			);
+			$this->log( 'Sequential line item #' . ( $index + 1 ) . ': ' . $name . ' price_cents=' . $price );
 
-			$added = $this->add_line_item( $clover_order_id, $name, $price, $apply_tax_for_item, $qty );
+			$added = $this->add_line_item_from_payload( $clover_order_id, $li );
 
 			if (empty($added['success']) || empty($added['id'])) {
 				$api_message = ! empty($added['message']) ? (string) $added['message'] : '';
@@ -1393,6 +1332,55 @@ class Clover_API
 	}
 
 	/**
+	 * Fallback: create Clover order via atomic_order API (single request).
+	 *
+	 * @param WC_Order $order WooCommerce order.
+	 * @return array|false Result array on success, false on failure.
+	 */
+	protected function create_atomic_order($order)
+	{
+		$line_data  = $this->build_atomic_line_items( $order, true );
+		$line_items = $this->sanitize_line_items_for_api( $line_data['elements'] );
+		$line_data  = array( 'elements' => $line_items );
+
+		if ( empty( $line_items ) ) {
+			return array(
+				'failure' => 'deterministic',
+				'message' => __( 'No line items could be mapped for Clover.', 'clover-gateway' ),
+			);
+		}
+
+		$tax_cents   = $this->calculate_order_tax_cents( $order );
+		$total_cents = (int) round( (float) $order->get_total() * 100 );
+
+		$payload = array(
+			'state'     => 'open',
+			'title'     => $this->get_order_title( $order ),
+			'note'      => $this->build_order_note( $order ),
+			'currency'  => strtoupper( $order->get_currency() ?: 'USD' ),
+			'total'     => $total_cents,
+			'taxAmount' => $tax_cents,
+			'lineItems' => $line_data,
+			'testMode'  => (bool) $this->test_mode,
+		);
+
+		$this->log( 'Atomic fallback payload: ' . wp_json_encode( $line_data ) );
+
+		$result = $this->request_v3(
+			'POST',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/atomic_order/orders',
+			$payload
+		);
+
+		$parsed = $this->parse_order_create_api_result( $order, $result, $tax_cents, $total_cents, count( $line_items ) );
+		if ( is_array( $parsed ) && ! $this->is_order_creation_failure( $parsed ) ) {
+			$parsed['used_sequential'] = false;
+		}
+
+		return $parsed;
+	}
+
+	/**
 	 * Explicitly set the total on a Clover order after line items are added.
 	 *
 	 * @param string $clover_order_id Clover order ID.
@@ -1437,26 +1425,27 @@ class Clover_API
 	{
 		$this->ensure_order_totals($order);
 
-		$created        = $this->create_atomic_order($order);
-		$atomic_failure = null;
+		// Prefer custom order + line_items — atomic_order can attach catalog inventory by name.
+		$created           = $this->create_order_sequential($order);
+		$sequential_failure = null;
 
 		if ($this->is_order_creation_failure($created)) {
-			$atomic_failure = $created;
+			$sequential_failure = $created;
 			$this->log(
-				'Atomic order creation failed for WC order #' . $order->get_order_number()
-					. ' — falling back to sequential. '
+				'Sequential order creation failed for WC order #' . $order->get_order_number()
+					. ' — falling back to atomic. '
 					. (isset($created['message']) ? $created['message'] : ''),
 				'warning'
 			);
-			$created = $this->create_order_sequential($order);
+			$created = $this->create_atomic_order($order);
 		}
 
 		if ($this->is_order_creation_failure($created)) {
 			$message = '';
 			if (! empty($created['message'])) {
 				$message = (string) $created['message'];
-			} elseif ($atomic_failure && ! empty($atomic_failure['message'])) {
-				$message = (string) $atomic_failure['message'];
+			} elseif ($sequential_failure && ! empty($sequential_failure['message'])) {
+				$message = (string) $sequential_failure['message'];
 			}
 			if ('' === $message) {
 				$message = __('Order could not be created in Clover.', 'clover-gateway');
@@ -1478,12 +1467,15 @@ class Clover_API
 
 		if ( function_exists( 'clover_gateway_is_order_debug_enabled' ) && clover_gateway_is_order_debug_enabled() ) {
 			$force_adhoc = ! empty( $created['used_sequential'] );
-			$snapshot    = $this->build_atomic_line_items( $order, $force_adhoc );
+			$snapshot    = $this->build_atomic_line_items( $order, true );
 			$order->update_meta_data( '_clover_debug_sent_payload', $snapshot['elements'] );
 			$order->update_meta_data( '_clover_debug_sync_path', $force_adhoc ? 'sequential' : 'atomic' );
+			$order->update_meta_data( '_clover_line_format', 'unit-expand-v1.0.7' );
 			$order->update_meta_data( '_clover_debug_saved_at', current_time( 'mysql' ) );
 			$order->save();
 		}
+
+		$this->audit_clover_line_items_after_sync( $created['clover_order_id'], $order );
 
 		return array(
 			'success'         => true,
@@ -2022,7 +2014,7 @@ class Clover_API
 			'GET',
 			'/merchants/' . rawurlencode( $this->merchant_id ) . '/orders/' . rawurlencode( $clover_order_id ),
 			array(),
-			array( 'expand' => 'lineItems' )
+			array( 'expand' => 'lineItems.item' )
 		);
 
 		if ( empty( $result['success'] ) || empty( $result['data'] ) ) {
@@ -2102,7 +2094,7 @@ class Clover_API
 			}
 
 			$unit_qty = isset( $li['unitQty'] ) ? (int) $li['unitQty'] : 0;
-			$qty_sold = isset( $li['quantitySold'] ) ? (float) $li['quantitySold'] : ( $unit_qty > 0 ? $unit_qty / 1000 : 0 );
+			$qty_sold = isset( $li['quantitySold'] ) ? (float) $li['quantitySold'] : ( $unit_qty > 0 ? $unit_qty / 1000 : 1 );
 			$printed  = array_key_exists( 'printed', $li ) ? (bool) $li['printed'] : null;
 
 			$item_id = '';
@@ -2136,7 +2128,7 @@ class Clover_API
 	 * @return string
 	 */
 	protected function format_pos_quantity_display( $unit_qty, $qty_sold, $printed ) {
-		$qty = (int) round( $qty_sold > 0 ? $qty_sold : ( $unit_qty / 1000 ) );
+		$qty = (int) round( $qty_sold > 0 ? $qty_sold : ( $unit_qty > 0 ? $unit_qty / 1000 : 1 ) );
 
 		if ( false === $printed ) {
 			return 'x1/0';
@@ -2177,6 +2169,10 @@ class Clover_API
 				if ( false === $clover['printed'] ) {
 					$status  = 'warn';
 					$notes[] = __( 'not printed — POS may show x1/0', 'clover-gateway' );
+				}
+				if ( ! empty( $clover['item_id'] ) ) {
+					$status  = 'error';
+					$notes[] = __( 'Clover linked catalog inventory — causes x1/1 on POS/kitchen', 'clover-gateway' );
 				}
 				if ( 'x1/0' === $clover['display_qty'] ) {
 					$status  = 'error';
