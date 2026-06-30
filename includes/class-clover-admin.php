@@ -106,24 +106,27 @@ class Clover_Admin {
 	}
 
 	/**
-	 * Build Clover_API from saved gateway settings.
+	 * Build Clover_API using gateway settings with POS-sync credential fallback.
 	 *
 	 * @return Clover_API|null
 	 */
 	protected function get_api_from_settings() {
-		$settings = get_option( 'woocommerce_clover_gateway_settings', array() );
+		if ( ! class_exists( 'Clover_Order_Sync' ) ) {
+			return null;
+		}
 
-		if ( empty( $settings['merchant_id'] ) || empty( $settings['api_token'] ) ) {
+		$creds = Clover_Order_Sync::get_sync_credentials();
+		if ( ! is_array( $creds ) || empty( $creds['merchant_id'] ) || empty( $creds['api_token'] ) ) {
 			return null;
 		}
 
 		return new Clover_API(
-			$settings['merchant_id'],
-			$settings['api_token'],
-			isset( $settings['public_key'] ) ? $settings['public_key'] : '',
-			isset( $settings['private_key'] ) ? $settings['private_key'] : '',
-			( isset( $settings['test_mode'] ) && 'yes' === $settings['test_mode'] ),
-			isset( $settings['default_tax_rate_id'] ) ? $settings['default_tax_rate_id'] : ''
+			$creds['merchant_id'],
+			$creds['api_token'],
+			isset( $creds['public_key'] ) ? $creds['public_key'] : '',
+			isset( $creds['private_key'] ) ? $creds['private_key'] : '',
+			! empty( $creds['test_mode'] ),
+			isset( $creds['default_tax_rate_id'] ) ? $creds['default_tax_rate_id'] : ''
 		);
 	}
 
@@ -318,26 +321,39 @@ class Clover_Admin {
 	 * Add order meta box with Clover details.
 	 */
 	public function add_order_metabox() {
-		add_meta_box(
-			'clover-payment-details',
-			__( 'Clover Payment Details', 'clover-gateway' ),
-			array( $this, 'render_order_metabox' ),
-			'shop_order',
-			'side',
-			'default'
-		);
+		$screens = array( 'shop_order' );
+		if ( function_exists( 'wc_get_page_screen_id' ) ) {
+			$screens[] = wc_get_page_screen_id( 'shop-order' );
+		}
+
+		foreach ( array_unique( $screens ) as $screen ) {
+			add_meta_box(
+				'clover-payment-details',
+				__( 'Clover Payment Details', 'clover-gateway' ),
+				array( $this, 'render_order_metabox' ),
+				$screen,
+				'side',
+				'default'
+			);
+		}
 	}
 
 	/**
 	 * Render meta box content.
 	 *
-	 * @param WP_Post $post Post object.
+	 * @param WP_Post|WC_Order $post_or_order Post or order object.
 	 */
-	public function render_order_metabox( $post ) {
-		$order_id       = $post->ID;
-		$clover_order_id = get_post_meta( $order_id, '_clover_order_id', true );
-		$charge_id      = get_post_meta( $order_id, '_clover_charge_id', true );
-		$amount_cents   = (int) get_post_meta( $order_id, '_clover_amount_cents', true );
+	public function render_order_metabox( $post_or_order ) {
+		$order = ( $post_or_order instanceof WC_Order ) ? $post_or_order : wc_get_order( $post_or_order );
+		if ( ! $order ) {
+			echo '<p>' . esc_html__( 'Order not found.', 'clover-gateway' ) . '</p>';
+			return;
+		}
+
+		$order_id        = $order->get_id();
+		$clover_order_id = $order->get_meta( '_clover_order_id', true );
+		$charge_id       = $order->get_meta( '_clover_charge_id', true );
+		$amount_cents    = (int) $order->get_meta( '_clover_amount_cents', true );
 
 		$amount_display = $amount_cents > 0 ? wc_price( $amount_cents / 100 ) : '&mdash;';
 
@@ -590,14 +606,13 @@ class Clover_Admin {
 
 		$wc_order_id     = absint( $_POST['order_id'] );
 		$wc_order        = wc_get_order( $wc_order_id );
-		$clover_order_id = $wc_order ? get_post_meta( $wc_order_id, '_clover_order_id', true ) : null;
+		$clover_order_id = $wc_order ? $wc_order->get_meta( '_clover_order_id', true ) : null;
 
 		if ( ! $clover_order_id ) {
 			wp_send_json_error( 'No Clover order ID found for this WC order.' );
 		}
 
-		$settings = get_option( 'woocommerce_clover_gateway_settings', array() );
-		$api      = $this->get_api_from_settings();
+		$api = $this->get_api_from_settings();
 
 		if ( ! $api ) {
 			wp_send_json_error( 'Clover API credentials are not configured.' );
@@ -606,11 +621,11 @@ class Clover_Admin {
 		$result = $api->fire_order( $clover_order_id, $wc_order_id );
 
 		if ( $result ) {
-			$wc_order->add_order_note( 'Clover print retried successfully.' );
-			wp_send_json_success( 'Print fired successfully.' );
-		} else {
-			wp_send_json_error( 'Print retry failed. Check Clover device is online.' );
+			$wc_order->add_order_note( __( 'Clover print retried successfully.', 'clover-gateway' ) );
+			wp_send_json_success( __( 'Print fired successfully.', 'clover-gateway' ) );
 		}
+
+		wp_send_json_error( __( 'Print retry failed or only partially succeeded. Check order notes and Clover device.', 'clover-gateway' ) );
 	}
 
 	/**
@@ -629,15 +644,28 @@ class Clover_Admin {
 		<script>
 		jQuery(document).on('click', '.clover-retry-print', function(e) {
 			e.preventDefault();
-			var $link = jQuery(this), orderId = $link.data('order-id');
-			$link.text('Retrying...');
+			var $link = jQuery(this);
+			if ($link.data('clover-retrying')) {
+				return;
+			}
+			var orderId = $link.data('order-id');
+			var retryLabel = '<?php echo esc_js( __( 'Retry print', 'clover-gateway' ) ); ?>';
+			$link.data('clover-retrying', 1).prop('disabled', true).text('<?php echo esc_js( __( 'Retrying...', 'clover-gateway' ) ); ?>');
 			jQuery.post(ajaxurl, {
 				action: 'clover_retry_print',
 				order_id: orderId,
 				nonce: '<?php echo esc_js( $nonce ); ?>'
-			}, function(res) {
-				alert(res.success ? res.data : ('Error: ' + res.data));
-				location.reload();
+			}).done(function(res) {
+				if (res.success) {
+					alert(res.data);
+					location.reload();
+					return;
+				}
+				alert('<?php echo esc_js( __( 'Error:', 'clover-gateway' ) ); ?> ' + res.data);
+				$link.data('clover-retrying', 0).prop('disabled', false).text(retryLabel);
+			}).fail(function() {
+				alert('<?php echo esc_js( __( 'Error: request failed.', 'clover-gateway' ) ); ?>');
+				$link.data('clover-retrying', 0).prop('disabled', false).text(retryLabel);
 			});
 		});
 		</script>
