@@ -539,3 +539,53 @@ body.clover-gateway-settings-page .clover-plugin-copyright a {
 	background: #1d4ed8;
 	color: #fff;
 }
+
+/* ========== Order debug panel ========== */
+.clover-debug-table {
+	margin-top: 12px;
+	font-size: 12px;
+}
+
+.clover-debug-table th,
+.clover-debug-table td {
+	vertical-align: top;
+}
+
+.clover-debug-ok {
+	background: #f0fdf4 !important;
+}
+
+.clover-debug-warn {
+	background: #fffbeb !important;
+}
+
+.clover-debug-error {
+	background: #fef2f2 !important;
+}
+
+.clover-debug-summary {
+	padding: 10px 12px;
+	border-radius: 6px;
+	border-left: 4px solid #cbd5e1;
+	margin: 0 0 8px;
+}
+
+.clover-debug-summary.clover-debug-ok {
+	border-left-color: #16a34a;
+	background: #f0fdf4;
+}
+
+.clover-debug-summary.clover-debug-warn {
+	border-left-color: #d97706;
+	background: #fffbeb;
+}
+
+.clover-debug-summary.clover-debug-error {
+	border-left-color: #dc2626;
+	background: #fef2f2;
+}
+
+#clover-order-debug .inside {
+	margin: 0;
+	padding: 12px;
+}

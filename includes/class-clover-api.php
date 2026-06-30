@@ -235,58 +235,50 @@ class Clover_API
 	 * @param string      $clover_order_id  Clover order ID.
 	 * @param string      $name             Line item name (used for custom items without inventory link).
 	 * @param int         $price_cents      Price in cents.
-	 * @param string|null $clover_item_id   Optional Clover inventory item ID. Links the line item to a
-	 *                                      revenue item (Reporting > Revenue Item Sales).
 	 * @param bool        $apply_tax        When true, embeds the configured default tax rate into the
 	 *                                      line item creation payload so Clover records it in the Tax Report.
 	 *                                      Pass false for shipping/fees to avoid taxing non-product lines.
+	 * @param int         $unit_qty         Quantity in Clover milli-units (qty 4 => 4000).
 	 *
 	 * @return array{success:bool,id?:string,message?:string}
 	 */
-	protected function add_line_item($clover_order_id, $name, $price_cents, $clover_item_id = null, $apply_tax = false, $unit_qty = 1000)
-	{
-		$unit_qty = max(1000, (int) $unit_qty);
-		$attempts = array();
+	protected function add_line_item( $clover_order_id, $name, $price_cents, $apply_tax = false, $unit_qty = 1000 ) {
+		$unit_qty = max( 1000, (int) $unit_qty );
+		$quantity = (int) $unit_qty / 1000;
 
-		if (! empty($clover_item_id) && is_string($clover_item_id)) {
-			$attempts[] = array(
-				'item_id'   => trim($clover_item_id),
-				'apply_tax' => (bool) $apply_tax,
-			);
-		}
-
-		$attempts[] = array(
-			'item_id'   => null,
-			'apply_tax' => (bool) $apply_tax,
+		$this->log(
+			'Sequential add_line_item: ' . $name
+			. ' qty=' . $quantity
+			. ' — ALWAYS AD-HOC (no item.id)'
 		);
 
-		if ($apply_tax) {
-			$attempts[] = array(
-				'item_id'   => null,
-				'apply_tax' => false,
-			);
+		$attempts = array(
+			array( 'apply_tax' => (bool) $apply_tax ),
+		);
+
+		if ( $apply_tax ) {
+			$attempts[] = array( 'apply_tax' => false );
 		}
 
 		$last_result = null;
 
-		foreach ($attempts as $attempt) {
+		foreach ( $attempts as $attempt ) {
 			$body = $this->build_line_item_request_body(
 				$name,
 				(int) $price_cents,
 				$unit_qty,
-				$attempt['item_id'],
 				$attempt['apply_tax']
 			);
 
 			$result = $this->request_v3(
 				'POST',
-				'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id) . '/line_items',
+				'/merchants/' . rawurlencode( $this->merchant_id ) . '/orders/' . rawurlencode( $clover_order_id ) . '/line_items',
 				$body
 			);
 
 			$last_result = $result;
 
-			if (! empty($result['success']) && ! empty($result['data']['id'])) {
+			if ( ! empty( $result['success'] ) && ! empty( $result['data']['id'] ) ) {
 				return array(
 					'success' => true,
 					'id'      => (string) $result['data']['id'],
@@ -312,27 +304,20 @@ class Clover_API
 	 * @param string      $name         Line item name.
 	 * @param int         $price_cents  Unit price in cents.
 	 * @param int         $unit_qty     Quantity in Clover milli-units.
-	 * @param string|null $clover_item_id Optional inventory item ID.
 	 * @param bool        $apply_tax    Whether to embed default tax metadata.
 	 * @return array<string,mixed>
 	 */
-	protected function build_line_item_request_body($name, $price_cents, $unit_qty, $clover_item_id = null, $apply_tax = false)
-	{
-		if (! empty($clover_item_id) && is_string($clover_item_id)) {
-			$body = array(
-				'item'    => array('id' => trim($clover_item_id)),
-				'price'   => (int) $price_cents,
-				'unitQty' => (int) $unit_qty,
-				'printed' => false,
-			);
-		} else {
-			$body = array(
-				'name'    => $name,
-				'price'   => (int) $price_cents,
-				'unitQty' => (int) $unit_qty,
-				'printed' => false,
-			);
-		}
+	protected function build_line_item_request_body( $name, $price_cents, $unit_qty, $apply_tax = false ) {
+		$quantity_sold = (float) ( (int) $unit_qty / 1000 );
+
+		$body = array(
+			'name'         => $name,
+			'price'        => (int) $price_cents,
+			'unitQty'      => (int) $unit_qty,
+			'quantitySold' => $quantity_sold,
+			'printed'      => false,
+			'exchanged'    => false,
+		);
 
 		if ($apply_tax && ! empty($this->default_tax_rate_id)) {
 			$full_rate = $this->get_tax_rate_by_id($this->default_tax_rate_id);
@@ -494,6 +479,10 @@ class Clover_API
 			return null;
 		}
 
+		if ( $this->is_clover_item_id_known_invalid( $clover_item_id ) ) {
+			return null;
+		}
+
 		$link = (bool) apply_filters(
 			'clover_gateway_link_inventory_items',
 			true,
@@ -505,13 +494,151 @@ class Clover_API
 	}
 
 	/**
-	 * Build atomic-order line items (simpler payload — matches Clover POS expectations).
+	 * Whether a Clover API error indicates a missing/invalid inventory item reference.
 	 *
-	 * @param WC_Order $order WooCommerce order.
+	 * @param array $result Response from request_v3().
+	 * @return bool
+	 */
+	protected function is_clover_invalid_item_reference_error( $result ) {
+		if ( empty( $result ) || ! is_array( $result ) ) {
+			return false;
+		}
+
+		$messages = array();
+		if ( ! empty( $result['message'] ) ) {
+			$messages[] = (string) $result['message'];
+		}
+		if ( ! empty( $result['data'] ) && is_array( $result['data'] ) ) {
+			if ( ! empty( $result['data']['message'] ) ) {
+				$messages[] = (string) $result['data']['message'];
+			}
+			if ( ! empty( $result['data']['details'] ) ) {
+				$messages[] = (string) $result['data']['details'];
+			}
+		}
+
+		foreach ( $messages as $message ) {
+			$lower = strtolower( $message );
+			if (
+				false !== strpos( $lower, 'does not exist' )
+				|| false !== strpos( $lower, 'referenced item' )
+				|| false !== strpos( $lower, 'cart_is_empty_or_missing' )
+			) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Transient key for a Clover item ID known to be invalid for this merchant.
+	 *
+	 * @param string $clover_item_id Clover inventory item ID.
+	 * @return string
+	 */
+	protected function invalid_clover_item_transient_key( $clover_item_id ) {
+		return 'clover_bad_item_' . md5( $this->merchant_id . '|' . trim( (string) $clover_item_id ) );
+	}
+
+	/**
+	 * Whether this Clover item ID was previously rejected by the API.
+	 *
+	 * @param string $clover_item_id Clover inventory item ID.
+	 * @return bool
+	 */
+	protected function is_clover_item_id_known_invalid( $clover_item_id ) {
+		if ( '' === trim( (string) $clover_item_id ) ) {
+			return false;
+		}
+
+		return (bool) get_transient( $this->invalid_clover_item_transient_key( $clover_item_id ) );
+	}
+
+	/**
+	 * Remember a Clover item ID that does not exist so we skip linking on future orders.
+	 *
+	 * @param string $clover_item_id Clover inventory item ID.
+	 */
+	protected function mark_clover_item_id_invalid( $clover_item_id ) {
+		$clover_item_id = trim( (string) $clover_item_id );
+		if ( '' === $clover_item_id ) {
+			return;
+		}
+
+		set_transient( $this->invalid_clover_item_transient_key( $clover_item_id ), 1, 7 * DAY_IN_SECONDS );
+	}
+
+	/**
+	 * Whether any atomic line item payload includes an inventory link.
+	 *
+	 * @param array<int,array<string,mixed>> $line_items Line item payloads.
+	 * @return bool
+	 */
+	protected function atomic_line_items_have_inventory_links( $line_items ) {
+		foreach ( $line_items as $li ) {
+			if ( ! empty( $li['item']['id'] ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Strip inventory links from atomic line items so Clover treats them as ad-hoc.
+	 *
+	 * @param array{elements:array<int,array<string,mixed>>} $line_data Atomic lineItems payload.
 	 * @return array{elements:array<int,array<string,mixed>>}
 	 */
-	protected function build_atomic_line_items($order)
-	{
+	protected function convert_atomic_line_items_to_adhoc( $line_data ) {
+		if ( empty( $line_data['elements'] ) || ! is_array( $line_data['elements'] ) ) {
+			return $line_data;
+		}
+
+		$elements = array();
+
+		foreach ( $line_data['elements'] as $li ) {
+			if ( ! empty( $li['item']['id'] ) ) {
+				$invalid_id = (string) $li['item']['id'];
+				$this->mark_clover_item_id_invalid( $invalid_id );
+				unset( $li['item'] );
+				$this->log(
+					'Converting to ad-hoc (invalid inventory id=' . $invalid_id . '): '
+					. ( isset( $li['name'] ) ? $li['name'] : '(unnamed)' ),
+					'warning'
+				);
+			}
+
+			$elements[] = $li;
+		}
+
+		return array( 'elements' => $elements );
+	}
+
+	/**
+	 * Whether an atomic order should be retried without inventory links.
+	 *
+	 * @param array                            $result     API response.
+	 * @param array<int,array<string,mixed>>   $line_items Line item payloads.
+	 * @return bool
+	 */
+	protected function should_fallback_atomic_to_adhoc( $result, $line_items ) {
+		if ( ! $this->atomic_line_items_have_inventory_links( $line_items ) ) {
+			return false;
+		}
+
+		return $this->is_clover_invalid_item_reference_error( $result );
+	}
+
+	/**
+	 * Build atomic-order line items (simpler payload — matches Clover POS expectations).
+	 *
+	 * @param WC_Order $order       WooCommerce order.
+	 * @param bool     $force_adhoc When true, skip inventory linking (ad-hoc only).
+	 * @return array{elements:array<int,array<string,mixed>>}
+	 */
+	protected function build_atomic_line_items( $order, $force_adhoc = false ) {
 		$elements = array();
 		$currency = $order->get_currency();
 
@@ -525,8 +652,13 @@ class Clover_API
 
 			$unit_price_cents = (int) round(($total / $quantity) * 100);
 
-			$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
-			$linked = null !== $clover_item_id;
+			$clover_item_id = null;
+			$linked         = false;
+
+			if ( ! $force_adhoc ) {
+				$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
+				$linked         = null !== $clover_item_id;
+			}
 
 			$li = array(
 				'name'         => $item->get_name(),
@@ -541,13 +673,21 @@ class Clover_API
 				$li['item'] = array( 'id' => $clover_item_id );
 			}
 
-			$this->log(
-				'Item [' . $item->get_name() . ']: '
-				. ( $linked
-					? 'inventory-linked id=' . $clover_item_id
-					: 'ad-hoc unitQty=' . $this->clover_unit_qty( $quantity ) )
-				. ' qty=' . $quantity
-			);
+			if ( $force_adhoc ) {
+				$this->log(
+					'Item [' . $item->get_name() . ']: FORCED ad-hoc unitQty='
+					. $this->clover_unit_qty( $quantity )
+					. ' qty=' . $quantity
+				);
+			} elseif ( $linked ) {
+				$this->log(
+					'Item [' . $item->get_name() . ']: inventory-linked id=' . $clover_item_id . ' qty=' . $quantity
+				);
+			} else {
+				$this->log(
+					'Item [' . $item->get_name() . ']: ad-hoc unitQty=' . $this->clover_unit_qty( $quantity ) . ' qty=' . $quantity
+				);
+			}
 
 			if ( ! empty( $this->default_tax_rate_id ) ) {
 				$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
@@ -682,11 +822,12 @@ class Clover_API
 			}
 
 			$this->log(
-				'Item [' . $item->get_name() . ']: '
-				. ( $linked
-					? 'inventory-linked id=' . $clover_item_id
-					: 'ad-hoc unitQty=' . $this->clover_unit_qty( $quantity ) )
-				. ' qty=' . $quantity
+				'[sequential] Line item: ' . $item->get_name()
+				. ' | qty=' . $quantity
+				. ' | unitQty=' . $this->clover_unit_qty( $quantity )
+				. ' | quantitySold=' . (float) $quantity
+				. ' | price_cents=' . $unit_price_cents
+				. ( $linked ? ' | linked=' . $clover_item_id : ' | ad-hoc' )
 			);
 
 			if (! empty($this->default_tax_rate_id)) {
@@ -1098,6 +1239,27 @@ class Clover_API
 			$payload
 		);
 
+		if (
+			empty( $result['success'] )
+			&& $this->should_fallback_atomic_to_adhoc( $result, $line_items )
+		) {
+			$this->log(
+				'Atomic order failed due to invalid inventory links for WC order #'
+				. $order->get_order_number()
+				. ' — retrying all line items as ad-hoc',
+				'warning'
+			);
+
+			$line_data            = $this->build_atomic_line_items( $order, true );
+			$payload['lineItems'] = $line_data;
+
+			$result = $this->request_v3(
+				'POST',
+				'/merchants/' . rawurlencode( $this->merchant_id ) . '/atomic_order/orders',
+				$payload
+			);
+		}
+
 		return $this->parse_order_create_api_result($order, $result, $tax_cents, $total_cents, count($line_items));
 	}
 
@@ -1109,7 +1271,8 @@ class Clover_API
 	 */
 	protected function create_order_sequential($order)
 	{
-		$line_data  = $this->build_atomic_line_items($order);
+		// Sequential fallback must never link inventory — ad-hoc line items only.
+		$line_data  = $this->build_atomic_line_items( $order, true );
 		$line_items = $line_data['elements'];
 
 		if (empty($line_items)) {
@@ -1148,12 +1311,19 @@ class Clover_API
 			$name    = isset( $li['name'] )         ? $li['name']         : '';
 			$price   = isset( $li['price'] )        ? (int) $li['price']  : 0;
 			$qty     = isset( $li['unitQty'] )      ? (int) $li['unitQty']: 1000;
-			$item_id = isset( $li['item']['id'] )   ? $li['item']['id']   : null;
+			$quantity = isset( $li['quantitySold'] ) ? (float) $li['quantitySold'] : ( (int) $qty / 1000 );
 			// Apply tax only for product line items (those that have taxRates set).
 			// Shipping and fee items in the array do not have taxRates.
 			$apply_tax_for_item = ! empty( $li['taxRates'] );
 
-			$added = $this->add_line_item( $clover_order_id, $name, $price, $item_id, $apply_tax_for_item, $qty );
+			$this->log(
+				'Sequential line item: ' . $name
+				. ' qty=' . $quantity
+				. ' unitQty=' . (int) $qty
+				. ' quantitySold=' . (float) $quantity
+			);
+
+			$added = $this->add_line_item( $clover_order_id, $name, $price, $apply_tax_for_item, $qty );
 
 			if (empty($added['success']) || empty($added['id'])) {
 				$api_message = ! empty($added['message']) ? (string) $added['message'] : '';
@@ -1208,12 +1378,17 @@ class Clover_API
 			usleep(200000);
 		}
 
-		$this->update_order_total($clover_order_id, $total_cents);
+		$total_cents = (int) round( (float) $order->get_total() * 100 );
+		$this->update_order_total( $clover_order_id, $total_cents );
+
+		// Sequential line items take longer to commit than atomic — wait before print.
+		sleep( 2 );
 
 		return array(
 			'clover_order_id' => $clover_order_id,
 			'tax_cents'       => $tax_cents,
 			'total_cents'     => $total_cents,
+			'used_sequential' => true,
 		);
 	}
 
@@ -1301,11 +1476,21 @@ class Clover_API
 			$this->update_order_tax_amount( $created['clover_order_id'], $final_tax );
 		}
 
+		if ( function_exists( 'clover_gateway_is_order_debug_enabled' ) && clover_gateway_is_order_debug_enabled() ) {
+			$force_adhoc = ! empty( $created['used_sequential'] );
+			$snapshot    = $this->build_atomic_line_items( $order, $force_adhoc );
+			$order->update_meta_data( '_clover_debug_sent_payload', $snapshot['elements'] );
+			$order->update_meta_data( '_clover_debug_sync_path', $force_adhoc ? 'sequential' : 'atomic' );
+			$order->update_meta_data( '_clover_debug_saved_at', current_time( 'mysql' ) );
+			$order->save();
+		}
+
 		return array(
 			'success'         => true,
 			'clover_order_id' => $created['clover_order_id'],
 			'tax_cents'       => $final_tax,
 			'total_cents'     => isset($created['total_cents']) ? $created['total_cents'] : 0,
+			'used_sequential' => ! empty( $created['used_sequential'] ),
 		);
 	}
 
@@ -1548,10 +1733,17 @@ class Clover_API
 	 * @param int|null $wc_order_id     WooCommerce order ID (for notes + meta).
 	 * @return bool True if at least one category printed.
 	 */
-	public function fire_order( $clover_order_id, $wc_order_id = null ) {
+	public function fire_order( $clover_order_id, $wc_order_id = null, $used_sequential = false ) {
 		if ( empty( $clover_order_id ) ) {
 			return false;
 		}
+
+		$this->log( sprintf(
+			'fire_order() called: clover_order=%s wc_order=%s sequential=%s',
+			$clover_order_id,
+			$wc_order_id ? $wc_order_id : 'null',
+			$used_sequential ? 'yes' : 'no'
+		) );
 
 		/**
 		 * Print categories for API-created orders.
@@ -1566,8 +1758,14 @@ class Clover_API
 		$any_success       = false;
 		$failed_categories = array();
 
+		// Wait for Clover to commit line items before print. Sequential path already slept 2s.
+		if ( ! $used_sequential ) {
+			usleep( 1500000 ); // 1.5 seconds for atomic orders
+		}
+
 		foreach ( $categories as $category ) {
-			usleep( 300000 );
+			// Delay between print categories (ORDER, RECEIPT) to avoid race conditions.
+			usleep( 800000 ); // 800ms
 
 			$result = $this->request_v3(
 				'POST',
@@ -1811,5 +2009,191 @@ class Clover_API
 		}
 
 		return array('success' => true);
+	}
+
+	/**
+	 * Fetch a Clover order with line items expanded (debug panel).
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return array{success:bool,order?:array,message?:string}
+	 */
+	public function fetch_order_with_line_items( $clover_order_id ) {
+		$result = $this->request_v3(
+			'GET',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/orders/' . rawurlencode( $clover_order_id ),
+			array(),
+			array( 'expand' => 'lineItems' )
+		);
+
+		if ( empty( $result['success'] ) || empty( $result['data'] ) ) {
+			return array(
+				'success' => false,
+				'message' => $this->api_error_message( $result ),
+			);
+		}
+
+		return array(
+			'success' => true,
+			'order'   => $result['data'],
+		);
+	}
+
+	/**
+	 * Build normalized sent line items for the debug panel.
+	 *
+	 * @param WC_Order $order       WooCommerce order.
+	 * @param bool     $force_adhoc Skip inventory linking.
+	 * @return array<int,array<string,mixed>>
+	 */
+	public function get_sent_line_items_for_debug( $order, $force_adhoc = false ) {
+		$this->ensure_order_totals( $order );
+		$data = $this->build_atomic_line_items( $order, $force_adhoc );
+
+		return $this->normalize_line_items_for_debug( $data['elements'] );
+	}
+
+	/**
+	 * Fetch and normalize Clover line items for the debug panel.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return array{success:bool,rows?:array,order_state?:string,message?:string}
+	 */
+	public function get_clover_line_items_for_debug( $clover_order_id ) {
+		$fetch = $this->fetch_order_with_line_items( $clover_order_id );
+		if ( empty( $fetch['success'] ) ) {
+			return $fetch;
+		}
+
+		$elements = array();
+		if ( ! empty( $fetch['order']['lineItems']['elements'] ) && is_array( $fetch['order']['lineItems']['elements'] ) ) {
+			$elements = $fetch['order']['lineItems']['elements'];
+		}
+
+		return array(
+			'success'     => true,
+			'rows'        => $this->normalize_line_items_for_debug( $elements ),
+			'order_state' => isset( $fetch['order']['state'] ) ? (string) $fetch['order']['state'] : '',
+		);
+	}
+
+	/**
+	 * Normalize line item payloads for debug comparison.
+	 *
+	 * @param array<int,array<string,mixed>> $elements Line items.
+	 * @return array<int,array<string,mixed>>
+	 */
+	public function normalize_line_items_for_debug( $elements ) {
+		$rows = array();
+
+		if ( ! is_array( $elements ) ) {
+			return $rows;
+		}
+
+		foreach ( $elements as $li ) {
+			if ( ! is_array( $li ) ) {
+				continue;
+			}
+
+			$name = '';
+			if ( ! empty( $li['name'] ) ) {
+				$name = (string) $li['name'];
+			} elseif ( ! empty( $li['item']['name'] ) ) {
+				$name = (string) $li['item']['name'];
+			}
+
+			$unit_qty = isset( $li['unitQty'] ) ? (int) $li['unitQty'] : 0;
+			$qty_sold = isset( $li['quantitySold'] ) ? (float) $li['quantitySold'] : ( $unit_qty > 0 ? $unit_qty / 1000 : 0 );
+			$printed  = array_key_exists( 'printed', $li ) ? (bool) $li['printed'] : null;
+
+			$item_id = '';
+			if ( ! empty( $li['item']['id'] ) ) {
+				$item_id = (string) $li['item']['id'];
+			} elseif ( ! empty( $li['item'] ) && is_string( $li['item'] ) ) {
+				$item_id = $li['item'];
+			}
+
+			$rows[] = array(
+				'name'          => $name,
+				'unit_qty'      => $unit_qty,
+				'quantity_sold' => $qty_sold,
+				'display_qty'   => $this->format_pos_quantity_display( $unit_qty, $qty_sold, $printed ),
+				'printed'       => $printed,
+				'item_id'       => $item_id,
+				'type'          => $item_id ? 'linked' : 'ad-hoc',
+				'price_cents'   => isset( $li['price'] ) ? (int) $li['price'] : 0,
+			);
+		}
+
+		return $rows;
+	}
+
+	/**
+	 * Estimate POS quantity label from Clover line item fields.
+	 *
+	 * @param int        $unit_qty     Clover milli-units.
+	 * @param float      $qty_sold     quantitySold.
+	 * @param bool|null  $printed      printed flag.
+	 * @return string
+	 */
+	protected function format_pos_quantity_display( $unit_qty, $qty_sold, $printed ) {
+		$qty = (int) round( $qty_sold > 0 ? $qty_sold : ( $unit_qty / 1000 ) );
+
+		if ( false === $printed ) {
+			return 'x1/0';
+		}
+
+		return 'x' . max( 1, $qty );
+	}
+
+	/**
+	 * Compare sent vs Clover line items for the debug panel.
+	 *
+	 * @param array<int,array<string,mixed>> $sent_rows   Normalized sent rows.
+	 * @param array<int,array<string,mixed>> $clover_rows Normalized Clover rows.
+	 * @return array<int,array<string,mixed>>
+	 */
+	public function build_debug_comparison( $sent_rows, $clover_rows ) {
+		$comparison = array();
+		$max        = max( count( $sent_rows ), count( $clover_rows ) );
+
+		for ( $i = 0; $i < $max; $i++ ) {
+			$sent   = isset( $sent_rows[ $i ] ) ? $sent_rows[ $i ] : null;
+			$clover = isset( $clover_rows[ $i ] ) ? $clover_rows[ $i ] : null;
+			$status = 'ok';
+			$notes  = array();
+
+			if ( ! $sent || ! $clover ) {
+				$status  = 'error';
+				$notes[] = __( 'Line count mismatch between sent and Clover', 'clover-gateway' );
+			} else {
+				if ( (int) $sent['unit_qty'] !== (int) $clover['unit_qty'] ) {
+					$status  = 'warn';
+					$notes[] = __( 'unitQty mismatch', 'clover-gateway' );
+				}
+				if ( abs( (float) $sent['quantity_sold'] - (float) $clover['quantity_sold'] ) > 0.01 ) {
+					$status  = 'warn';
+					$notes[] = __( 'quantitySold mismatch', 'clover-gateway' );
+				}
+				if ( false === $clover['printed'] ) {
+					$status  = 'warn';
+					$notes[] = __( 'not printed — POS may show x1/0', 'clover-gateway' );
+				}
+				if ( 'x1/0' === $clover['display_qty'] ) {
+					$status  = 'error';
+					$notes[] = __( 'POS quantity x1/0', 'clover-gateway' );
+				}
+			}
+
+			$comparison[] = array(
+				'index'  => $i + 1,
+				'name'   => $sent ? $sent['name'] : ( $clover ? $clover['name'] : '' ),
+				'sent'   => $sent,
+				'clover' => $clover,
+				'status' => $status,
+				'notes'  => implode( '; ', $notes ),
+			);
+		}
+
+		return $comparison;
 	}
 }

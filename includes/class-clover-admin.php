@@ -36,12 +36,15 @@ class Clover_Admin {
 		add_filter( 'woocommerce_settings_api_form_fields_clover_gateway', array( $this, 'add_admin_fields' ), 20, 1 );
 		add_filter( 'admin_body_class', array( $this, 'add_settings_body_class' ) );
 		add_action( 'add_meta_boxes', array( $this, 'add_order_metabox' ) );
+		add_action( 'add_meta_boxes', array( $this, 'add_order_debug_metabox' ) );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_scripts' ) );
+		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_order_debug_scripts' ) );
 
 		add_action( 'wp_ajax_clover_validate_credentials', array( $this, 'ajax_validate_credentials' ) );
 		add_action( 'wp_ajax_clover_refresh_item_cache', array( $this, 'ajax_refresh_item_cache' ) );
 		add_action( 'wp_ajax_clover_load_tax_rates', array( $this, 'ajax_load_tax_rates' ) );
 		add_action( 'wp_ajax_clover_retry_print', array( $this, 'ajax_retry_print' ) );
+		add_action( 'wp_ajax_clover_fetch_order_debug', array( $this, 'ajax_fetch_order_debug' ) );
 		add_action( 'admin_footer', array( $this, 'retry_print_inline_script' ) );
 
 		// Product field: Clover Item ID — links line items to Clover inventory so they appear in Reporting > Revenue Item Sales.
@@ -91,6 +94,224 @@ class Clover_Admin {
 		);
 
 		return $fields;
+	}
+
+	/**
+	 * Whether order debug UI is enabled.
+	 *
+	 * @return bool
+	 */
+	public static function is_order_debug_enabled() {
+		return function_exists( 'clover_gateway_is_order_debug_enabled' ) && clover_gateway_is_order_debug_enabled();
+	}
+
+	/**
+	 * Build Clover_API from saved gateway settings.
+	 *
+	 * @return Clover_API|null
+	 */
+	protected function get_api_from_settings() {
+		$settings = get_option( 'woocommerce_clover_gateway_settings', array() );
+
+		if ( empty( $settings['merchant_id'] ) || empty( $settings['api_token'] ) ) {
+			return null;
+		}
+
+		return new Clover_API(
+			$settings['merchant_id'],
+			$settings['api_token'],
+			isset( $settings['public_key'] ) ? $settings['public_key'] : '',
+			isset( $settings['private_key'] ) ? $settings['private_key'] : '',
+			( isset( $settings['test_mode'] ) && 'yes' === $settings['test_mode'] ),
+			isset( $settings['default_tax_rate_id'] ) ? $settings['default_tax_rate_id'] : ''
+		);
+	}
+
+	/**
+	 * Register Clover order debug metabox (classic + HPOS).
+	 */
+	public function add_order_debug_metabox() {
+		if ( ! self::is_order_debug_enabled() ) {
+			return;
+		}
+
+		$screens = array( 'shop_order' );
+		if ( function_exists( 'wc_get_page_screen_id' ) ) {
+			$screens[] = wc_get_page_screen_id( 'shop-order' );
+		}
+
+		foreach ( array_unique( $screens ) as $screen ) {
+			add_meta_box(
+				'clover-order-debug',
+				__( 'Clover Order Debug', 'clover-gateway' ),
+				array( $this, 'render_order_debug_metabox' ),
+				$screen,
+				'normal',
+				'high'
+			);
+		}
+	}
+
+	/**
+	 * Render Clover order debug metabox.
+	 *
+	 * @param WP_Post|WC_Order $post_or_order Post or order object.
+	 */
+	public function render_order_debug_metabox( $post_or_order ) {
+		$order = ( $post_or_order instanceof WC_Order ) ? $post_or_order : wc_get_order( $post_or_order->ID );
+		if ( ! $order ) {
+			echo '<p>' . esc_html__( 'Order not found.', 'clover-gateway' ) . '</p>';
+			return;
+		}
+
+		$order_id        = $order->get_id();
+		$clover_order_id = $order->get_meta( '_clover_order_id', true );
+		$sync_path       = $order->get_meta( '_clover_debug_sync_path', true );
+		$saved_at        = $order->get_meta( '_clover_debug_saved_at', true );
+
+		if ( ! $clover_order_id ) {
+			echo '<p>' . esc_html__( 'No Clover order ID on this order yet. Place/sync the order first.', 'clover-gateway' ) . '</p>';
+			return;
+		}
+
+		echo '<p class="description">' . esc_html__( 'Compare what WooCommerce sent to Clover vs what Clover stored. Use this to verify quantity (x4 vs x1/0) and print status without calling the restaurant.', 'clover-gateway' ) . '</p>';
+
+		if ( $sync_path || $saved_at ) {
+			echo '<p><strong>' . esc_html__( 'Last sync snapshot:', 'clover-gateway' ) . '</strong> ';
+			echo esc_html( $sync_path ? $sync_path : '—' );
+			if ( $saved_at ) {
+				echo ' · ' . esc_html( $saved_at );
+			}
+			echo '</p>';
+		}
+
+		echo '<p><button type="button" class="button button-primary clover-fetch-debug" data-order-id="' . esc_attr( (string) $order_id ) . '">';
+		echo esc_html__( 'Refresh from Clover', 'clover-gateway' );
+		echo '</button></p>';
+
+		echo '<div id="clover-order-debug-panel">';
+		echo '<p class="description">' . esc_html__( 'Click Refresh from Clover to load live line items from the Clover API.', 'clover-gateway' ) . '</p>';
+		echo '</div>';
+	}
+
+	/**
+	 * Enqueue scripts on WooCommerce order edit screens.
+	 *
+	 * @param string $hook Hook suffix.
+	 */
+	public function enqueue_order_debug_scripts( $hook ) {
+		if ( ! self::is_order_debug_enabled() ) {
+			return;
+		}
+
+		$order_screens = array( 'post.php', 'post-new.php', 'woocommerce_page_wc-orders' );
+		if ( function_exists( 'wc_get_page_screen_id' ) ) {
+			$order_screens[] = wc_get_page_screen_id( 'shop-order' );
+		}
+		$order_screens = array_unique( $order_screens );
+
+		if ( ! in_array( $hook, $order_screens, true ) ) {
+			return;
+		}
+
+		wp_enqueue_style(
+			'clover-admin',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/css/clover-admin.css',
+			array(),
+			WC_CLOVER_GATEWAY_VERSION
+		);
+
+		wp_enqueue_script(
+			'clover-order-debug',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/js/clover-order-debug.js',
+			array( 'jquery' ),
+			WC_CLOVER_GATEWAY_VERSION,
+			true
+		);
+
+		wp_localize_script(
+			'clover-order-debug',
+			'clover_order_debug_params',
+			array(
+				'ajax_url' => admin_url( 'admin-ajax.php' ),
+				'nonce'    => wp_create_nonce( 'clover_order_debug_nonce' ),
+				'i18n'     => array(
+					'loading'         => __( 'Loading…', 'clover-gateway' ),
+					'refresh'         => __( 'Refresh from Clover', 'clover-gateway' ),
+					'fetch_failed'    => __( 'Could not fetch Clover order. Check API credentials.', 'clover-gateway' ),
+					'no_lines'        => __( 'No line items found.', 'clover-gateway' ),
+					'item'            => __( 'Item', 'clover-gateway' ),
+					'sent_qty'        => __( 'Sent (qty / unitQty)', 'clover-gateway' ),
+					'clover_qty'      => __( 'Clover (qty / unitQty)', 'clover-gateway' ),
+					'pos_display'     => __( 'POS display', 'clover-gateway' ),
+					'printed'         => __( 'Printed', 'clover-gateway' ),
+					'type'            => __( 'Type', 'clover-gateway' ),
+					'status'          => __( 'Notes', 'clover-gateway' ),
+					'ok'              => __( 'OK', 'clover-gateway' ),
+					'warnings'        => __( 'warnings', 'clover-gateway' ),
+					'errors'          => __( 'errors', 'clover-gateway' ),
+					'summary_prefix'  => __( 'Comparison:', 'clover-gateway' ),
+					'refreshed'       => __( 'Refreshed at', 'clover-gateway' ),
+				),
+			)
+		);
+	}
+
+	/**
+	 * AJAX: Fetch Clover order debug comparison.
+	 */
+	public function ajax_fetch_order_debug() {
+		check_ajax_referer( 'clover_order_debug_nonce', 'nonce' );
+
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Unauthorized', 'clover-gateway' ) ) );
+		}
+
+		if ( ! self::is_order_debug_enabled() ) {
+			wp_send_json_error( array( 'message' => __( 'Order debug panel is disabled.', 'clover-gateway' ) ) );
+		}
+
+		$wc_order_id = absint( $_POST['order_id'] );
+		$order       = wc_get_order( $wc_order_id );
+		if ( ! $order ) {
+			wp_send_json_error( array( 'message' => __( 'Order not found.', 'clover-gateway' ) ) );
+		}
+
+		$clover_order_id = $order->get_meta( '_clover_order_id', true );
+		if ( ! $clover_order_id ) {
+			wp_send_json_error( array( 'message' => __( 'No Clover order ID on this order.', 'clover-gateway' ) ) );
+		}
+
+		$api = $this->get_api_from_settings();
+		if ( ! $api ) {
+			wp_send_json_error( array( 'message' => __( 'Clover API credentials are not configured.', 'clover-gateway' ) ) );
+		}
+
+		$snapshot     = $order->get_meta( '_clover_debug_sent_payload', true );
+		$sync_path    = $order->get_meta( '_clover_debug_sync_path', true );
+		$force_adhoc  = ( 'sequential' === $sync_path );
+
+		if ( is_array( $snapshot ) && ! empty( $snapshot ) ) {
+			$sent_rows = $api->normalize_line_items_for_debug( $snapshot );
+		} else {
+			$sent_rows = $api->get_sent_line_items_for_debug( $order, $force_adhoc );
+		}
+
+		$clover = $api->get_clover_line_items_for_debug( $clover_order_id );
+		if ( empty( $clover['success'] ) ) {
+			wp_send_json_error( array( 'message' => isset( $clover['message'] ) ? $clover['message'] : __( 'Clover fetch failed.', 'clover-gateway' ) ) );
+		}
+
+		$rows = $api->build_debug_comparison( $sent_rows, $clover['rows'] );
+
+		wp_send_json_success(
+			array(
+				'rows'        => $rows,
+				'order_state' => isset( $clover['order_state'] ) ? $clover['order_state'] : '',
+				'sync_path'   => $sync_path,
+				'fetched_at'  => current_time( 'mysql' ),
+			)
+		);
 	}
 
 	/**
@@ -376,14 +597,11 @@ class Clover_Admin {
 		}
 
 		$settings = get_option( 'woocommerce_clover_gateway_settings', array() );
-		$api = new Clover_API(
-			isset( $settings['merchant_id'] )     ? $settings['merchant_id']     : '',
-			isset( $settings['api_token'] )        ? $settings['api_token']        : '',
-			isset( $settings['ecomm_public_key'] ) ? $settings['ecomm_public_key'] : '',
-			isset( $settings['ecomm_private_key'] )? $settings['ecomm_private_key']: '',
-			( isset( $settings['test_mode'] ) && 'yes' === $settings['test_mode'] ),
-			isset( $settings['tax_rate_id'] )      ? $settings['tax_rate_id']      : ''
-		);
+		$api      = $this->get_api_from_settings();
+
+		if ( ! $api ) {
+			wp_send_json_error( 'Clover API credentials are not configured.' );
+		}
 
 		$result = $api->fire_order( $clover_order_id, $wc_order_id );
 

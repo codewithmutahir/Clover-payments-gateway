@@ -114,6 +114,13 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 				'default'     => '',
 				'placeholder' => 'e.g. ABCDE12345FGH',
 			),
+			'order_debug' => array(
+				'title'       => __( 'Order Debug Panel', 'clover-gateway' ),
+				'type'        => 'checkbox',
+				'label'       => __( 'Enable Clover order debug panel on WooCommerce orders', 'clover-gateway' ),
+				'default'     => 'no',
+				'description' => __( 'Shows a debug metabox on each order: what we sent to Clover vs what Clover stored (qty, unitQty, printed). Use this to verify x1/0 issues without calling the restaurant.', 'clover-gateway' ),
+			),
 		);
 	}
 
@@ -259,6 +266,7 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 
 		$clover_order_id = $clover_order['clover_order_id'];
 		$amount_cents    = (int) round((float) $order->get_total() * 100);
+		$used_sequential = ! empty( $clover_order['used_sequential'] );
 
 		// Save order ID immediately to prevent duplicate syncs from status hook.
 		update_post_meta($order_id, '_clover_order_id', $clover_order_id);
@@ -267,7 +275,7 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		// No card token — COD / pay on pickup via Clover gateway.
 		// Order is created and sent to Clover printers but remains Open until paid on device.
 		if (! $will_charge) {
-			$api->fire_order( $clover_order_id, $order->get_id() );
+			$api->fire_order( $clover_order_id, $order->get_id(), $used_sequential );
 
 			$order->update_status(
 				'on-hold',
@@ -313,7 +321,7 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		$card_last4 = isset($charge['card_last4']) ? $charge['card_last4'] : '';
 
 		// Step 3: Fire order to kitchen/printer (best-effort — non-fatal).
-		$api->fire_order( $clover_order_id, $order->get_id() );
+		$api->fire_order( $clover_order_id, $order->get_id(), $used_sequential );
 
 		// Step 4: Mark WooCommerce order as paid.
 		$order->payment_complete($charge_id);
