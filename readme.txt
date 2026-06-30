@@ -5,7 +5,7 @@ Tags: clover, payment gateway, woocommerce, credit card, checkout
 Requires at least: 5.8
 Tested up to: 6.4
 Requires PHP: 7.4
-Stable tag: 1.0.2
+Stable tag: 1.0.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -58,27 +58,17 @@ Add the line items in the WooCommerce order, then use “Push new items to Clove
 
 == Changelog ==
 
-= 1.0.2 =
-* Fix Clover tax calculation divisor and order-level taxAmount for configured tax rates.
-* Prevent double tax by omitting a separate WC Tax line when Default Tax Rate ID is set.
-* Compact checkout card form; Clover SDK styling for iframe fields.
-* Add non-card POS order sync (COD, BACS) with duplicate-prevention lock and manual re-sync action.
-* Sync credentials fall back to official Clover Payments plugin when gateway settings are empty.
-* Improved API error handling and idempotent order recovery.
+For the full version history, see changelog.txt in the plugin root.
 
-= 1.0.1 =
-* Fix XSS in checkout error display by escaping error messages.
-
-= 1.0.0 =
-* Initial release. Clover card payments, order sync, tax reporting, inventory sync, COD/pickup support.
+= 1.0.3 =
+* Fix Clover POS quantity display and kitchen printing reliability.
+* Add optional Order Debug Panel and admin Retry Print for failed prints.
+* Reorganize admin and public asset folders.
 
 == Upgrade Notice ==
 
+= 1.0.3 =
+POS print and quantity fixes. Recommended for all sites using kitchen printing.
+
 = 1.0.2 =
-Tax reporting, checkout UI, and POS sync reliability improvements. Recommended for all sites.
-
-= 1.0.1 =
-Security fix for checkout error display.
-
-= 1.0.0 =
-Initial release.
+Tax reporting, checkout UI, and POS sync reliability improvements.

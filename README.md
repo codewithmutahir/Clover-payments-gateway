@@ -1,6 +1,6 @@
 # Clover Payment Gateway for WooCommerce
 
-[![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)](clover-gateway.php)
+[![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)](clover-gateway.php)
 [![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-blue.svg)](https://wordpress.org/)
 [![WooCommerce](https://img.shields.io/badge/WooCommerce-5.0%2B-purple.svg)](https://woocommerce.com/)
 [![PHP](https://img.shields.io/badge/PHP-7.4%2B-777BB4.svg)](https://www.php.net/)
@@ -287,6 +287,8 @@ Refunds initiated in WooCommerce admin are sent to Clover when a `_clover_charge
 ```
 clover-gateway/
 ├── clover-gateway.php              # Bootstrap, constants, gateway registration
+├── changelog.txt                   # Full version history (WordPress-style)
+├── readme.txt                      # WordPress.org-compatible plugin readme
 ├── uninstall.php                   # Cleans credentials and license data on delete
 ├── includes/
 │   ├── class-wc-clover-gateway.php # WooCommerce payment gateway
@@ -297,9 +299,12 @@ clover-gateway/
 │   ├── class-clover-inventory-admin.php
 │   ├── class-clover-license-manager.php
 │   └── class-clover-license-setup.php
-├── assets/
-│   ├── js/                         # Checkout (clover-checkout.js), admin, inventory
-│   └── css/                        # Admin and checkout (clover-checkout.css) styles
+├── admin/
+│   ├── css/clover-admin.css        # WooCommerce admin styles
+│   └── js/                         # Admin, inventory, order-debug scripts
+├── public/
+│   ├── css/clover-checkout.css     # Checkout card form styles
+│   └── js/clover-checkout.js       # Clover iframe checkout
 └── templates/
     └── payment-form.php            # Clover iframe mount points
 ```
@@ -344,6 +349,7 @@ clover-gateway/
 | Item Sales report empty | Products not linked | Run Clover Sync; set `_clover_item_id` per product |
 | Tax missing in Tax Report | No Default Tax Rate ID | **Browse Tax Rates** and save the correct ID |
 | Tax amount wrong / doubled | Stale config or WC tax line + Clover rate | Set Default Tax Rate ID; upgrade to 1.0.2+ |
+| Wrong qty on POS (x1/0) | Invalid `_clover_item_id` or legacy print path | Upgrade to 1.0.3+; use Order Debug Panel; fix product Clover IDs |
 | Order synced twice | Concurrent hooks | Fixed in 1.0.2 via DB lock + meta-before-fire; check custom hooks |
 | POS shows x1/0 or x1/1 qty | Legacy /fire partial kitchen send | Uses print_event API (not legacy /fire); upgrade to latest plugin |
 | Card fields too large at checkout | Theme overrides iframe height | Hard-refresh; ensure `clover-checkout.css` loads |
@@ -393,26 +399,9 @@ Defined in `clover-gateway.php`:
 
 ## Changelog
 
-See [readme.txt](readme.txt) for the WordPress.org-compatible changelog.
+See [changelog.txt](changelog.txt) for the full version history.
 
-### 1.0.2
-
-- Fix Clover tax divisor (`/ 1_000_000_000`) for line-item and order-level `taxAmount`.
-- Skip WooCommerce “Tax” line item when Default Tax Rate ID is set to prevent double-counting.
-- Use `calculate_order_tax_cents()` in sequential order creation; apply tax only to product lines.
-- Compact checkout card form with Clover SDK styling (no duplicate external labels).
-- Add `Clover_Order_Sync` for non-card orders (COD, BACS, etc.) with official-plugin credential fallback.
-- Prevent duplicate POS sync via atomic DB lock, single status hook, and meta saved before `fire_order`.
-- Manual **Send to Clover POS** order action; sync on `pending`, `processing`, and `on-hold`.
-- Improved API error handling and idempotent order recovery after ambiguous failures.
-
-### 1.0.1
-
-- Fix XSS in checkout error display by escaping error messages with jQuery DOM APIs.
-
-### 1.0.0
-
-- Initial release: Clover card payments, order sync, tax reporting, inventory sync, COD/pickup support.
+Recent highlights in **1.0.3**: POS quantity/print fixes, Order Debug Panel, `admin/` + `public/` asset layout.
 
 ---
 

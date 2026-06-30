@@ -48,7 +48,7 @@ class Clover_Inventory_Admin {
 		}
 		wp_enqueue_style(
 			'clover-admin',
-			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/css/clover-admin.css',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'admin/css/clover-admin.css',
 			array(),
 			WC_CLOVER_GATEWAY_VERSION
 		);
@@ -57,7 +57,7 @@ class Clover_Inventory_Admin {
 
 		wp_enqueue_script(
 			'clover-inventory',
-			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/js/clover-inventory.js',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'admin/js/clover-inventory.js',
 			array( 'jquery' ),
 			WC_CLOVER_GATEWAY_VERSION,
 			true

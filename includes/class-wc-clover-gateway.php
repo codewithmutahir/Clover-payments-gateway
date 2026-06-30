@@ -172,7 +172,7 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 
 		wp_register_script(
 			'clover-checkout',
-			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/js/clover-checkout.js',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'public/js/clover-checkout.js',
 			array('jquery', 'wc-checkout', 'clover-sdk'),
 			WC_CLOVER_GATEWAY_VERSION,
 			true
@@ -197,7 +197,7 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 
 		wp_enqueue_style(
 			'clover-checkout',
-			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/css/clover-checkout.css',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'public/css/clover-checkout.css',
 			array(),
 			WC_CLOVER_GATEWAY_VERSION
 		);
