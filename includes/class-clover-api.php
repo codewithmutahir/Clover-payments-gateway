@@ -1731,7 +1731,7 @@ class Clover_API
 	 *
 	 * @param string   $clover_order_id Clover order ID.
 	 * @param int|null $wc_order_id     WooCommerce order ID (for notes + meta).
-	 * @return bool True if at least one category printed.
+	 * @return bool True when all requested print categories succeed.
 	 */
 	public function fire_order( $clover_order_id, $wc_order_id = null, $used_sequential = false ) {
 		if ( empty( $clover_order_id ) ) {
@@ -1816,7 +1816,7 @@ class Clover_API
 			}
 		}
 
-		return $any_success;
+		return empty( $failed_categories ) && $any_success;
 	}
 
 	/**
