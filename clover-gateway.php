@@ -64,6 +64,19 @@ function clover_gateway_run_license_weekly_verify() {
 add_action( 'clover_license_weekly_verify', 'clover_gateway_run_license_weekly_verify' );
 
 /**
+ * Whether the Clover order debug panel is enabled (settings or WP_DEBUG).
+ *
+ * @return bool
+ */
+function clover_gateway_is_order_debug_enabled() {
+	$settings = get_option( 'woocommerce_clover_gateway_settings', array() );
+	if ( isset( $settings['order_debug'] ) && 'yes' === $settings['order_debug'] ) {
+		return true;
+	}
+	return defined( 'WP_DEBUG' ) && WP_DEBUG;
+}
+
+/**
  * Main plugin bootstrap.
  */
 class Clover_Gateway_Plugin {

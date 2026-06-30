@@ -387,7 +387,7 @@ class Clover_Order_Sync {
 		$order->update_meta_data( '_clover_amount_cents', $amount_cents );
 		$order->save();
 
-		$api->fire_order( $clover_order_id );
+		$api->fire_order( $clover_order_id, $order->get_id(), ! empty( $result['used_sequential'] ) );
 
 		$env = ! empty( $creds['test_mode'] )
 			? __( 'sandbox Clover', 'clover-gateway' )
