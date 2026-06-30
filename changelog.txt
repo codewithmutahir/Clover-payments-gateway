@@ -1,0 +1,28 @@
+*** Clover Payment Gateway for WooCommerce Changelog ***
+
+2026-06-28 - version 1.0.3
+* Fix - Clover POS quantity display (x1/0, x1/4) by using ad-hoc line items on sequential sync and invalid _clover_item_id fallback.
+* Fix - Kitchen printing via print_event instead of legacy /fire endpoint.
+* Add - Optional Order Debug Panel on WooCommerce orders (settings checkbox; also shown when WP_DEBUG is on).
+* Add - WC order notes and admin Retry Print when kitchen printing fails.
+* Fix - fire_order reports failure unless all print categories succeed.
+* Fix - HPOS support for Clover Payment Details metabox.
+* Update - Admin API uses Clover_Order_Sync credential fallback when gateway settings are empty.
+* Update - Plugin folder layout: admin/ and public/ asset directories (aligned with official Clover plugin structure).
+
+2026-01-01 - version 1.0.2
+* Fix - Clover tax calculation divisor and order-level taxAmount for configured tax rates.
+* Fix - Prevent double tax by omitting a separate WC Tax line when Default Tax Rate ID is set.
+* Update - Compact checkout card form; Clover SDK styling for iframe fields.
+* Add - Non-card POS order sync (COD, BACS) with duplicate-prevention lock and manual re-sync action.
+* Update - Sync credentials fall back to official Clover Payments plugin when gateway settings are empty.
+* Update - Improved API error handling and idempotent order recovery.
+
+2025-12-01 - version 1.0.1
+* Fix - XSS in checkout error display by escaping error messages.
+
+2025-11-01 - version 1.0.0
+* Add - Clover card payments (authorize, capture, charge, refund, void) via PCI-compliant iframe.
+* Add - Full order sync to Clover POS with line items and tax reporting.
+* Add - Inventory sync and product mapping to Clover items.
+* Add - COD / pickup order support with mark-as-paid in Clover.

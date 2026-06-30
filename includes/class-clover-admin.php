@@ -219,14 +219,14 @@ class Clover_Admin {
 
 		wp_enqueue_style(
 			'clover-admin',
-			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/css/clover-admin.css',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'admin/css/clover-admin.css',
 			array(),
 			WC_CLOVER_GATEWAY_VERSION
 		);
 
 		wp_enqueue_script(
 			'clover-order-debug',
-			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/js/clover-order-debug.js',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'admin/js/clover-order-debug.js',
 			array( 'jquery' ),
 			WC_CLOVER_GATEWAY_VERSION,
 			true
@@ -397,14 +397,14 @@ class Clover_Admin {
 
 		wp_enqueue_style(
 			'clover-admin',
-			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/css/clover-admin.css',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'admin/css/clover-admin.css',
 			array(),
 			WC_CLOVER_GATEWAY_VERSION
 		);
 
 		wp_enqueue_script(
 			'clover-admin',
-			WC_CLOVER_GATEWAY_PLUGIN_URL . 'assets/js/clover-admin.js',
+			WC_CLOVER_GATEWAY_PLUGIN_URL . 'admin/js/clover-admin.js',
 			array( 'jquery' ),
 			WC_CLOVER_GATEWAY_VERSION,
 			true
