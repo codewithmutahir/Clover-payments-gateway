@@ -178,7 +178,7 @@ sequenceDiagram
     Clover-->>JS: Card token
     JS->>Store: POST clover_card_token
     Store->>Clover: Create order + line items (v3 REST)
-    Store->>Clover: Charge card (eCommerce API)
+    Store->>Clover: Pay for that order (eCommerce API)
     Store->>Clover: Fire order to printers
     Store->>WC: Mark order paid
 ```
@@ -186,9 +186,11 @@ sequenceDiagram
 1. Clover iframe fields collect card data (never touches your server).
 2. A single-use token is posted with the checkout form.
 3. A Clover order is created with WooCommerce line items.
-4. The card is charged against that order.
+4. The card is charged via `POST /v1/orders/{orderId}/pay` so the payment settles on that order. The charge endpoint (`POST /v1/charges`) takes no order reference and always creates a second, unitemized order, so it is only used as a fallback when Clover rejects the pay request outright. Return `false` from `clover_gateway_allow_charge_fallback` to disable that fallback.
 5. The order is fired to kitchen/register printers.
 6. WooCommerce order status is set to paid; charge and card metadata are stored.
+
+If payment fails, the unpaid Clover order is deleted so no Open ticket is left behind. An order that already carries a payment is kept and flagged in a WooCommerce order note instead.
 
 Checkout renders four compact iframe fields (card number, expiry, CVC, ZIP). Placeholders and styling are applied inside the Clover SDK; the plugin does not duplicate labels outside the iframe.
 

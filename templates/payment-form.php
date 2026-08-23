@@ -20,5 +20,6 @@ if ( ! defined( 'ABSPATH' ) ) {
 		<div id="clover-card-zip" class="clover-card-field-element clover-card-row-full"></div>
 	</div>
 
-	<input type="hidden" name="clover_card_token" value="" />
+	<input type="hidden" name="clover_card_token" id="clover-card-token" value="" />
+	<input type="hidden" name="clover_transresult" id="clover-transresult" value="0" />
 </fieldset>

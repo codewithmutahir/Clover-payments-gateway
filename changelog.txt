@@ -1,5 +1,38 @@
 *** Clover Payment Gateway for WooCommerce Changelog ***
 
+2026-08-23 - version 1.0.13
+* Fix - Duplicate Clover orders: card payments now settle on the itemized order via the pay-for-order endpoint. The charge endpoint has no order parameter, so it always created a second order whose receipt showed "Item 1" with no tax breakdown, leaving the real order Open and unpaid.
+* Fix - Delete the unpaid Clover order when a payment fails, so declines no longer leave Open tickets the kitchen can act on. Orders that already carry a payment are kept and flagged in an order note.
+* Fix - A failed payment no longer marks the WooCommerce order as processed; retrying a declined card reuses the same Clover order instead of creating another.
+* Fix - Clear the idempotency key after a decline so a retry with a different card is actually charged rather than replaying the original response.
+* Add - Order note when Clover reports a balance still due after payment (merchant-side service charge or tax rate).
+* Add - Filter clover_gateway_allow_charge_fallback to block the legacy charge endpoint outright, even if it means failing checkout.
+
+2026-08-14 - version 1.0.12
+* Fix - Include WooCommerce customer note and theme order notes (_kr_order_notes) in Clover order note so kitchen tickets show special requests.
+* Fix - Read KR fulfillment meta (_kr_fulfillment_type, _kr_preferred_datetime) for pickup/delivery line on Clover note.
+* Add - Filter clover_gateway_order_note to customize POS/kitchen note text.
+
+2026-07-08 - version 1.0.11
+* Fix - Charge payload uses order_id + ecomind to match official Clover plugin and API docs.
+* Fix - Surface real Clover eCommerce error messages at checkout instead of generic failure text.
+* Fix - Accept charge success when status is succeeded/captured, not only paid=true.
+* Fix - test_mode defaults to off when unset (was incorrectly defaulting to sandbox).
+* Fix - Reset card token after checkout AJAX refresh so retries tokenize again.
+
+2026-07-08 - version 1.0.10
+* Fix - Bind checkout_place_order on form.checkout (WC triggerHandler does not bubble to document.body).
+* Fix - Match official plugin: transresult validation flag, merchantId in Clover SDK, form.submit() after token.
+* Fix - Reset token/validation when card iframe fields change.
+
+2026-07-08 - version 1.0.9
+* Fix - Checkout tokenization: hook WooCommerce checkout_place_order (not form submit) so clover_card_token is sent with AJAX checkout.
+* Fix - Read Clover createToken() result.token as string (clv_…) per SDK docs; accept nested .token.token as fallback.
+* Fix - Remount Clover iframes after updated_checkout when payment markup is replaced.
+
+2026-07-01 - version 1.0.8
+* Fix - Kitchen double-print: fire ORDER category only by default (was ORDER + RECEIPT). Use filter clover_gateway_print_categories to add RECEIPT if needed.
+
 2026-07-01 - version 1.0.7
 * Fix - Root cause of 1/1 on kitchen tickets: never send unitQty; expand each unit into its own ad-hoc line item (qty 2 = two lines). Enable Clover Setup → Group line items to merge on print.
 * Add - Post-sync audit logs order note if Clover still attaches catalog inventory or unitQty.
