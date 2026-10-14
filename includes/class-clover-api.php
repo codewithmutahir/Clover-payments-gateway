@@ -280,6 +280,39 @@ class Clover_API
 	}
 
 	/**
+	 * Discard the stored idempotency key for an order.
+	 *
+	 * Clover replays the original response for a repeated key, so a retry after a
+	 * decline must use a fresh key or the customer's second card is never charged.
+	 *
+	 * @param int $order_id WooCommerce order ID.
+	 */
+	protected function clear_idempotency_key($order_id)
+	{
+		delete_transient('clover_idem_' . (int) $order_id);
+	}
+
+	/**
+	 * Whether a failed payment attempt is safe to retry with a new idempotency key.
+	 *
+	 * Ambiguous failures are excluded: the card may have been charged, and a fresh
+	 * key would let a retry charge it again.
+	 *
+	 * @param array $result Failed payment result.
+	 * @return bool
+	 */
+	protected function is_retryable_payment_failure($result)
+	{
+		if (! empty($result['declined'])) {
+			return true;
+		}
+
+		$code = isset($result['http_code']) ? (int) $result['http_code'] : 0;
+
+		return $code >= 400 && $code < 500 && ! in_array($code, array(408, 429), true);
+	}
+
+	/**
 	 * Add a single line item to a Clover order.
 	 *
 	 * @param string      $clover_order_id  Clover order ID.
@@ -1614,10 +1647,419 @@ class Clover_API
 	}
 
 	/**
-	 * Charge a tokenized card against a Clover order.
+	 * Resolve the customer's IP for Clover fraud signals.
 	 *
-	 * Returns a rich result array including card brand, last4, and the Clover v3 payment ID
-	 * so callers can persist these for display in WooCommerce and in the Clover Orders dashboard.
+	 * Clover requires X-Forwarded-For on the pay-for-order endpoint, so this never
+	 * returns an empty string.
+	 *
+	 * @return string
+	 */
+	protected function get_client_ip()
+	{
+		$ip = class_exists('WC_Geolocation')
+			? WC_Geolocation::get_ip_address()
+			: sanitize_text_field(wp_unslash(isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : ''));
+
+		return $ip ? $ip : '0.0.0.0';
+	}
+
+	/**
+	 * Build the settlement reference sent to the merchant's gateway.
+	 *
+	 * Clover caps this at 12 alphanumeric characters (spaces allowed).
+	 *
+	 * @param WC_Order $order WooCommerce order.
+	 * @return string
+	 */
+	protected function build_external_reference_id($order)
+	{
+		$reference = preg_replace('/[^A-Za-z0-9 ]/', '', (string) $order->get_id());
+
+		return substr((string) $reference, 0, 12);
+	}
+
+	/**
+	 * Normalise Clover brand codes to human-readable names (mirrors official plugin).
+	 *
+	 * @param string $card_brand Raw brand from the API.
+	 * @return string
+	 */
+	protected function normalize_card_brand($card_brand)
+	{
+		$card_brand = trim((string) $card_brand);
+
+		if ('' === $card_brand) {
+			return '';
+		}
+
+		$brand_map = array(
+			'MC'       => 'MasterCard',
+			'MASTER'   => 'MasterCard',
+			'VISA'     => 'Visa',
+			'AMEX'     => 'American Express',
+			'DISCOVER' => 'Discover',
+			'DINERS'   => 'Diners Club',
+			'JCB'      => 'JCB',
+		);
+
+		$brand_upper = strtoupper($card_brand);
+
+		if (isset($brand_map[$brand_upper])) {
+			return $brand_map[$brand_upper];
+		}
+
+		// Title-case any unrecognised brand so display looks clean.
+		return ucwords(strtolower($card_brand));
+	}
+
+	/**
+	 * Fetch the v3 payment records attached to a Clover order.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return array|null Payment elements, or null when the lookup itself failed.
+	 */
+	protected function get_order_payments($clover_order_id)
+	{
+		$result = $this->request_v3(
+			'GET',
+			'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id) . '/payments',
+			array(),
+			array('expand' => 'tender,cardTransaction')
+		);
+
+		if (empty($result['success']) || ! isset($result['data'])) {
+			return null;
+		}
+
+		return isset($result['data']['elements']) && is_array($result['data']['elements'])
+			? $result['data']['elements']
+			: array();
+	}
+
+	/**
+	 * Read tender and card details from the v3 payment attached to a paid order.
+	 *
+	 * The pay-for-order response does not include the v3 payment ID, which the
+	 * WooCommerce admin panels display, so it is fetched from the order.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return array{payment_id:string,tender_label:string,card_brand:string,card_last4:string}
+	 */
+	protected function get_order_payment_details($clover_order_id)
+	{
+		$details = array(
+			'payment_id'   => '',
+			'tender_label' => '',
+			'card_brand'   => '',
+			'card_last4'   => '',
+		);
+
+		$payments = $this->get_order_payments($clover_order_id);
+
+		if (empty($payments)) {
+			return $details;
+		}
+
+		$payment = end($payments);
+
+		if (! empty($payment['id'])) {
+			$details['payment_id'] = (string) $payment['id'];
+		}
+		if (! empty($payment['tender']['label'])) {
+			$details['tender_label'] = (string) $payment['tender']['label'];
+		}
+		if (! empty($payment['cardTransaction']['cardType'])) {
+			$details['card_brand'] = (string) $payment['cardTransaction']['cardType'];
+		}
+		if (! empty($payment['cardTransaction']['last4'])) {
+			$details['card_last4'] = (string) $payment['cardTransaction']['last4'];
+		}
+
+		return $details;
+	}
+
+	/**
+	 * Delete a Clover order that was created for a payment which never completed.
+	 *
+	 * Refuses to delete when the order already carries a payment, or when the
+	 * payment lookup failed — an ambiguous network failure may mean the card was
+	 * charged even though the client saw an error.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return bool True when the order was removed.
+	 */
+	public function abandon_unpaid_order($clover_order_id)
+	{
+		if (empty($clover_order_id)) {
+			return false;
+		}
+
+		$payments = $this->get_order_payments($clover_order_id);
+
+		if (null === $payments) {
+			$this->log(
+				'Keeping order ' . $clover_order_id . ' — could not verify whether it has payments.',
+				'warning'
+			);
+			return false;
+		}
+
+		if (! empty($payments)) {
+			$this->log(
+				'Keeping order ' . $clover_order_id . ' — it already has ' . count($payments) . ' payment(s).',
+				'warning'
+			);
+			return false;
+		}
+
+		return $this->delete_clover_order($clover_order_id);
+	}
+
+	/**
+	 * Whether an eCommerce API error body represents a card decline.
+	 *
+	 * @param array $result Response from request_ecomm().
+	 * @return bool
+	 */
+	protected function is_decline_response($result)
+	{
+		if (402 === (isset($result['http_code']) ? (int) $result['http_code'] : 0)) {
+			return true;
+		}
+
+		$body = isset($result['data']) && is_array($result['data']) ? $result['data'] : array();
+
+		if (! empty($body['error']['decline_code'])) {
+			return true;
+		}
+
+		$haystack = strtolower(
+			(isset($body['error']['code']) ? (string) $body['error']['code'] : '')
+			. ' ' . (isset($body['error']['reason']) ? (string) $body['error']['reason'] : '')
+			. ' ' . (isset($result['message']) ? (string) $result['message'] : '')
+		);
+
+		return false !== strpos($haystack, 'declin');
+	}
+
+	/**
+	 * Whether a failed pay-for-order attempt should retry on the legacy charge endpoint.
+	 *
+	 * The legacy endpoint always creates its own order in Clover, so it is only
+	 * acceptable when Clover deterministically rejected the pay-for-order request
+	 * for a structural reason. Ambiguous failures are never retried: the card may
+	 * already have been charged.
+	 *
+	 * @param array $result Failed result from pay_order().
+	 * @return bool
+	 */
+	protected function should_fallback_to_standalone_charge($result)
+	{
+		if (! empty($result['success']) || ! empty($result['declined'])) {
+			return false;
+		}
+
+		$code = isset($result['http_code']) ? (int) $result['http_code'] : 0;
+
+		if ($code <= 0 || $code >= 500 || in_array($code, array(408, 429), true)) {
+			return false;
+		}
+
+		if (! in_array($code, array(400, 403, 404, 405, 501), true)) {
+			return false;
+		}
+
+		/**
+		 * Filter whether a failed pay-for-order may fall back to POST /v1/charges.
+		 *
+		 * The fallback keeps payments working on merchants where pay-for-order is
+		 * unavailable, at the cost of a second, unitemized order in Clover.
+		 *
+		 * @param bool  $allow  Whether to allow the fallback.
+		 * @param array $result Failed pay-for-order result.
+		 */
+		return (bool) apply_filters('clover_gateway_allow_charge_fallback', true, $result);
+	}
+
+	/**
+	 * Pay for an existing Clover order with a tokenized card.
+	 *
+	 * Uses POST /v1/orders/{orderId}/pay so the payment settles against the order
+	 * we already built with real line items, tax, and the kitchen note. The
+	 * charge endpoint cannot do this — it ignores any order reference and always
+	 * creates a second, unitemized order that shows as "Item 1" on the receipt.
+	 *
+	 * @param string   $card_token      Card token from Clover iframe.
+	 * @param int      $amount_cents    Total amount in cents (includes tax + fees).
+	 * @param string   $clover_order_id Clover order ID.
+	 * @param WC_Order $order           WooCommerce order.
+	 * @return array Same shape as charge_card().
+	 */
+	protected function pay_order($card_token, $amount_cents, $clover_order_id, $order)
+	{
+		$order_id = $order->get_id();
+
+		// Only the keys below are accepted — the endpoint rejects unknown properties.
+		$payload = array(
+			'source'   => $card_token,
+			'amount'   => (int) $amount_cents,
+			'currency' => strtolower($order->get_currency() ?: 'usd'),
+			'ecomind'  => 'ecom',
+			'metadata' => array(
+				'shopping_cart' => 'WP ' . get_bloginfo('version') . ' | WC ' . WC_VERSION . ' | CloverGW ' . WC_CLOVER_GATEWAY_VERSION,
+				'wc_order'      => (string) $order->get_order_number(),
+			),
+		);
+
+		$email = $order->get_billing_email();
+		if ($email) {
+			$payload['email'] = $email;
+		}
+
+		$reference = $this->build_external_reference_id($order);
+		if ('' !== $reference) {
+			$payload['external_reference_id'] = $reference;
+		}
+
+		$result = $this->request_ecomm(
+			'POST',
+			'/orders/' . rawurlencode($clover_order_id) . '/pay',
+			$payload,
+			array(
+				'Idempotency-Key' => $this->generate_idempotency_key($order_id),
+				'X-Forwarded-For' => $this->get_client_ip(),
+			)
+		);
+
+		if (empty($result['success'])) {
+			$message = ! empty($result['message'])
+				? (string) $result['message']
+				: __('Payment could not be processed. Please try again.', 'clover-gateway');
+
+			$declined = $this->is_decline_response($result);
+			if ($declined) {
+				$message = __('Your card was declined. Please try another card.', 'clover-gateway');
+			}
+
+			$this->log(
+				'Pay-for-order failed on ' . $clover_order_id . ': ' . $message
+					. ' | ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result),
+				'error'
+			);
+
+			return array(
+				'success'   => false,
+				'declined'  => $declined,
+				'message'   => $message,
+				'http_code' => isset($result['http_code']) ? (int) $result['http_code'] : 0,
+				'data'      => isset($result['data']) ? $result['data'] : null,
+			);
+		}
+
+		$data        = is_array($result['data']) ? $result['data'] : array();
+		$status      = isset($data['status']) ? strtolower((string) $data['status']) : '';
+		$amount_paid = isset($data['amount_paid']) ? (int) $data['amount_paid'] : 0;
+		$amount_due  = isset($data['amount_due']) ? (int) $data['amount_due'] : 0;
+		$is_paid     = in_array($status, array('paid', 'fulfilled'), true) || $amount_paid >= (int) $amount_cents;
+
+		if (! $is_paid) {
+			$this->log(sprintf(
+				'Pay-for-order not paid: order=%s status=%s amount_paid=%d amount=%d',
+				$clover_order_id,
+				$status ? $status : 'unknown',
+				$amount_paid,
+				(int) $amount_cents
+			), 'error');
+
+			return array(
+				'success'  => false,
+				'declined' => false,
+				'message'  => __('Payment could not be processed. Please try again.', 'clover-gateway'),
+				// Treated as ambiguous: Clover accepted the request but did not report a paid order.
+				'http_code' => 0,
+			);
+		}
+
+		$charge_id = '';
+		if (! empty($data['charge'])) {
+			$charge_id = is_array($data['charge'])
+				? (isset($data['charge']['id']) ? (string) $data['charge']['id'] : '')
+				: (string) $data['charge'];
+		}
+
+		$card_brand     = '';
+		$card_last4     = '';
+		$card_exp_month = '';
+		$card_exp_year  = '';
+
+		if (! empty($data['source']) && is_array($data['source'])) {
+			$src            = $data['source'];
+			$card_brand     = isset($src['brand'])     ? (string) $src['brand'] : '';
+			$card_last4     = isset($src['last4'])     ? trim((string) $src['last4']) : '';
+			$card_exp_month = isset($src['exp_month']) ? str_pad((string) $src['exp_month'], 2, '0', STR_PAD_LEFT) : '';
+			$card_exp_year  = isset($src['exp_year'])  ? (string) $src['exp_year'] : '';
+		}
+
+		$payment = $this->get_order_payment_details($clover_order_id);
+
+		if ('' === $card_brand) {
+			$card_brand = $payment['card_brand'];
+		}
+		if ('' === $card_last4) {
+			$card_last4 = $payment['card_last4'];
+		}
+
+		$card_brand = $this->normalize_card_brand($card_brand);
+
+		if ('' === $charge_id) {
+			$this->log(
+				'Pay-for-order succeeded on ' . $clover_order_id . ' without a charge ID — refunds will need the Clover dashboard.',
+				'warning'
+			);
+		}
+
+		// Clover's own order total can exceed what WooCommerce charged (for example a
+		// merchant-side service charge), which leaves the order short-paid on the POS.
+		if ($amount_due > 0) {
+			$this->log(sprintf(
+				'Pay-for-order left a balance: order=%s status=%s amount_paid=%d amount_due=%d',
+				$clover_order_id,
+				$status ? $status : 'unknown',
+				$amount_paid,
+				$amount_due
+			), 'warning');
+		}
+
+		$this->log(sprintf(
+			'Pay-for-order success: order=%s charge_id=%s payment_id=%s brand=%s last4=%s tender=%s',
+			$clover_order_id,
+			$charge_id,
+			$payment['payment_id'],
+			$card_brand,
+			$card_last4,
+			$payment['tender_label']
+		));
+
+		return array(
+			'success'        => true,
+			'charge_id'      => $charge_id,
+			'payment_id'     => $payment['payment_id'],
+			'card_brand'     => $card_brand,
+			'card_last4'     => $card_last4,
+			'card_exp_month' => $card_exp_month,
+			'card_exp_year'  => $card_exp_year,
+			'tender_label'   => $payment['tender_label'],
+			'amount_due'     => $amount_due,
+			'raw'            => $data,
+		);
+	}
+
+	/**
+	 * Pay for a Clover order with a tokenized card.
+	 *
+	 * Prefers the pay-for-order endpoint so the payment lands on the itemized
+	 * order. Falls back to a standalone charge only when Clover deterministically
+	 * refuses that request.
 	 *
 	 * @param string   $card_token      Card token from Clover iframe.
 	 * @param int      $amount_cents    Total amount in cents (includes tax + fees).
@@ -1633,19 +2075,67 @@ class Clover_API
 	 *     @type string $card_exp_month Two-digit expiry month.
 	 *     @type string $card_exp_year  Four-digit expiry year.
 	 *     @type string $tender_label   Human-readable tender label from Clover, e.g. "Credit Card".
+	 *     @type bool   $duplicate_order Whether Clover created a second, unitemized order.
 	 *     @type array  $raw            Full decoded API response.
 	 * }
 	 */
 	public function charge_card($card_token, $amount_cents, $clover_order_id, $order)
 	{
+		$paid = $this->pay_order($card_token, $amount_cents, $clover_order_id, $order);
+
+		if (! empty($paid['success'])) {
+			return $paid;
+		}
+
+		if (! $this->should_fallback_to_standalone_charge($paid)) {
+			if ($this->is_retryable_payment_failure($paid)) {
+				$this->clear_idempotency_key($order->get_id());
+			}
+
+			return $paid;
+		}
+
+		$this->log(
+			'Falling back to standalone charge for order ' . $clover_order_id
+				. ' — Clover will create a second, unitemized order.',
+			'warning'
+		);
+
+		// Fresh key for the retry: Clover deterministically rejected the pay request,
+		// so nothing was charged and replaying its cached response would be wrong.
+		$this->clear_idempotency_key($order->get_id());
+
+		$charged = $this->create_standalone_charge($card_token, $amount_cents, $clover_order_id, $order);
+
+		if (! empty($charged['success'])) {
+			$charged['duplicate_order'] = true;
+		} elseif ($this->is_retryable_payment_failure($charged)) {
+			$this->clear_idempotency_key($order->get_id());
+		}
+
+		return $charged;
+	}
+
+	/**
+	 * Charge a tokenized card without an order reference (legacy fallback).
+	 *
+	 * Clover always creates a new order for a standalone charge, and that order
+	 * carries a single "Item 1" line rather than the WooCommerce line items.
+	 *
+	 * @param string   $card_token      Card token from Clover iframe.
+	 * @param int      $amount_cents    Total amount in cents (includes tax + fees).
+	 * @param string   $clover_order_id Clover order ID (logging only).
+	 * @param WC_Order $order           WooCommerce order.
+	 *
+	 * @return array Same shape as charge_card().
+	 */
+	protected function create_standalone_charge($card_token, $amount_cents, $clover_order_id, $order)
+	{
 		$order_id  = $order->get_id();
 		$currency  = strtolower($order->get_currency() ?: 'usd');
 		$tax_cents = (int) round((float) $order->get_total_tax() * 100);
 
-		// Resolve the customer's IP for Clover fraud signals.
-		$ip = class_exists('WC_Geolocation')
-			? WC_Geolocation::get_ip_address()
-			: sanitize_text_field(wp_unslash(isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : ''));
+		$ip = $this->get_client_ip();
 
 		$payload = array(
 			'source'                       => $card_token,
@@ -1654,7 +2144,7 @@ class Clover_API
 			'capture'                      => true,
 			'ecomind'                      => 'ecom',
 			'description'                  => 'WooCommerce Order #' . $order->get_order_number(),
-			'external_reference_id'        => (string) $order_id,
+			'external_reference_id'        => $this->build_external_reference_id($order),
 			'metadata'                     => array(
 				'shopping_cart' => 'WP ' . get_bloginfo('version') . ' | WC ' . WC_VERSION . ' | CloverGW ' . WC_CLOVER_GATEWAY_VERSION,
 			),
@@ -1692,10 +2182,8 @@ class Clover_API
 		// Idempotency key: prevents duplicate charges on accidental double-submit.
 		$extra_headers = array(
 			'Idempotency-Key' => $this->generate_idempotency_key($order_id),
+			'X-Forwarded-For' => $ip,
 		);
-		if ($ip) {
-			$extra_headers['X-Forwarded-For'] = $ip;
-		}
 
 		$result = $this->request_ecomm('POST', '/charges', $payload, $extra_headers);
 
@@ -1704,16 +2192,19 @@ class Clover_API
 				? $result['message']
 				: __('Payment could not be processed. Please try again.', 'clover-gateway');
 
-			if (! empty($result['data']['error']['reason'])) {
-				$reason = strtolower((string) $result['data']['error']['reason']);
-				if (false !== strpos($reason, 'declined')) {
-					$message = __('Your card was declined. Please try another card.', 'clover-gateway');
-				}
+			$declined = $this->is_decline_response($result);
+			if ($declined) {
+				$message = __('Your card was declined. Please try another card.', 'clover-gateway');
 			}
 
 			$this->log('Charge failed: ' . $message . ' | ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result), 'error');
 
-			return array('success' => false, 'message' => $message);
+			return array(
+				'success'   => false,
+				'declined'  => $declined,
+				'message'   => $message,
+				'http_code' => isset($result['http_code']) ? (int) $result['http_code'] : 0,
+			);
 		}
 
 		$data = $result['data'];
@@ -1758,7 +2249,7 @@ class Clover_API
 
 		if (! empty($data['source']) && is_array($data['source'])) {
 			$src            = $data['source'];
-			$card_brand     = isset($src['brand'])     ? strtoupper(trim((string) $src['brand']))     : '';
+			$card_brand     = isset($src['brand'])     ? trim((string) $src['brand'])                : '';
 			$card_last4     = isset($src['last4'])      ? trim((string) $src['last4'])                : '';
 			$card_exp_month = isset($src['exp_month'])  ? str_pad((string) $src['exp_month'], 2, '0', STR_PAD_LEFT) : '';
 			$card_exp_year  = isset($src['exp_year'])   ? (string) $src['exp_year']                  : '';
@@ -1777,7 +2268,7 @@ class Clover_API
 			if (! empty($payment['cardTransaction']) && is_array($payment['cardTransaction'])) {
 				$ct = $payment['cardTransaction'];
 				if (empty($card_brand) && ! empty($ct['cardType'])) {
-					$card_brand = strtoupper(trim((string) $ct['cardType']));
+					$card_brand = trim((string) $ct['cardType']);
 				}
 				if (empty($card_last4) && ! empty($ct['last4'])) {
 					$card_last4 = trim((string) $ct['last4']);
@@ -1785,23 +2276,7 @@ class Clover_API
 			}
 		}
 
-		// Normalise brand codes to human-readable names (mirrors official plugin).
-		$brand_map = array(
-			'MC'      => 'MasterCard',
-			'MASTER'  => 'MasterCard',
-			'VISA'    => 'Visa',
-			'AMEX'    => 'American Express',
-			'DISCOVER' => 'Discover',
-			'DINERS'  => 'Diners Club',
-			'JCB'     => 'JCB',
-		);
-		$brand_upper = strtoupper($card_brand);
-		if (isset($brand_map[$brand_upper])) {
-			$card_brand = $brand_map[$brand_upper];
-		} elseif ($card_brand) {
-			// Title-case any unrecognised brand so display looks clean.
-			$card_brand = ucwords(strtolower($card_brand));
-		}
+		$card_brand = $this->normalize_card_brand($card_brand);
 
 		// Extract the order ID that the eCommerce API auto-created for this charge.
 		// This is the order that actually carries the payment / tender — callers

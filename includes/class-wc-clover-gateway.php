@@ -233,7 +233,9 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		// Already charged — don't create a second Clover order or charge again.
 		// A Clover order ID alone is not enough: a previous attempt may have
 		// created the POS ticket and then failed to take payment.
-		if ( $order->get_meta( '_clover_charge_id' ) ) {
+		$clover_order_id    = (string) $order->get_meta( '_clover_order_id' );
+		$existing_charge_id = (string) $order->get_meta( '_clover_charge_id' );
+		if ( $existing_charge_id || ( '' !== $clover_order_id && $order->is_paid() ) ) {
 			return array(
 				'result'   => 'success',
 				'redirect' => $this->get_return_url( $order ),
@@ -267,12 +269,11 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		);
 
 		$amount_cents    = (int) round( (float) $order->get_total() * 100 );
-		$clover_order_id = (string) $order->get_meta( '_clover_order_id' );
 		$used_sequential = false;
 
 		// Step 1: Create ONE Clover v3 order with the same item names + taxes
-		// that COD/pickup uses (create_order_with_items). Reuse it on retry if
-		// a previous attempt created the POS ticket but the card pay failed.
+		// that COD/pickup uses (create_order_with_items). Reuse it on retry when
+		// a previous attempt left a ticket that could not be safely deleted.
 		if ( '' === $clover_order_id ) {
 			$clover_order = $api->create_order_with_items( $order );
 
@@ -294,13 +295,13 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 			$order->save();
 		}
 
-		// Step 2: Pay THAT order. /v1/orders/{id}/pay attaches the card tender
-		// to the existing ticket and marks it Paid. /v1/charges is never used
-		// here — that endpoint always creates a second "Item 1" order.
-		$charge = $api->pay_for_order(
-			$clover_order_id,
+		// Step 2: Pay that order. charge_card() uses POST /v1/orders/{id}/pay so
+		// the card tender lands on the itemized ticket. A standalone /v1/charges
+		// call is only a last resort when Clover rejects pay-for-order.
+		$charge = $api->charge_card(
 			$card_token,
 			$amount_cents,
+			$clover_order_id,
 			$order
 		);
 
@@ -311,13 +312,30 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 
 			wc_add_notice( $message, 'error' );
 
+			// Remove the unpaid order so Clover is not left showing an open ticket
+			// the kitchen might act on. Skipped when the order already has a payment
+			// or the lookup failed — then the ticket is kept and the retry pays it.
+			$abandoned = $api->abandon_unpaid_order( $clover_order_id );
+
+			if ( $abandoned ) {
+				$order->delete_meta_data( '_clover_order_id' );
+				$order->delete_meta_data( '_clover_amount_cents' );
+			}
+
 			$order->add_order_note(
-				sprintf(
-					/* translators: 1: error message 2: Clover order ID */
-					__( 'Clover charge failed: %1$s (Clover Order ID: %2$s)', 'clover-gateway' ),
-					$message,
-					$clover_order_id
-				)
+				$abandoned
+					? sprintf(
+						/* translators: 1: error message 2: Clover order ID */
+						__( 'Clover payment failed: %1$s. Unpaid Clover order %2$s was removed.', 'clover-gateway' ),
+						$message,
+						$clover_order_id
+					)
+					: sprintf(
+						/* translators: 1: error message 2: Clover order ID */
+						__( 'Clover payment failed: %1$s (Clover Order ID: %2$s). Check this order in Clover — it may need to be closed or voided manually.', 'clover-gateway' ),
+						$message,
+						$clover_order_id
+					)
 			);
 			$order->save();
 
@@ -354,7 +372,27 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		// Step 3: Fire kitchen/printer (best-effort — non-fatal).
 		$api->fire_order( $clover_order_id, $order->get_id(), $used_sequential );
 
-		$order->payment_complete( $charge_id );
+		// Step 4: Mark WooCommerce order as paid. Card meta was saved above so a
+		// retry cannot double-charge if this or the kitchen print fails.
+		$transaction_id = $charge_id ? $charge_id : $payment_id;
+		$order->payment_complete( $transaction_id );
+
+		if ( ! empty( $charge['duplicate_order'] ) ) {
+			$order->add_order_note(
+				__( 'Clover could not take payment on the itemized order, so the card was charged separately. Clover now holds a second order for this payment showing a single generic item. Reconcile both orders before closing them.', 'clover-gateway' )
+			);
+		}
+
+		if ( ! empty( $charge['amount_due'] ) ) {
+			$order->add_order_note(
+				sprintf(
+					/* translators: 1: outstanding amount 2: Clover order ID */
+					__( 'Clover still shows %1$s due on order %2$s after payment. Clover\'s order total is higher than the WooCommerce total — check for a service charge or tax rate configured on the Clover side.', 'clover-gateway' ),
+					wc_price( (float) $charge['amount_due'] / 100 ),
+					$clover_order_id
+				)
+			);
+		}
 
 		// Build the human-readable card summary for the order note.
 		$card_summary = '';
@@ -363,13 +401,20 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 		}
 
 		$order->add_order_note(
-			sprintf(
-				/* translators: 1: Clover charge ID  2: Clover order ID  3: card summary */
-				__( 'Clover payment successful. Charge ID: %1$s | Clover Order ID: %2$s%3$s', 'clover-gateway' ),
-				$charge_id,
-				$clover_order_id,
-				$card_summary
-			)
+			$charge_id
+				? sprintf(
+					/* translators: 1: Clover charge ID  2: Clover order ID  3: card summary */
+					__( 'Clover payment successful. Charge ID: %1$s | Clover Order ID: %2$s%3$s', 'clover-gateway' ),
+					$charge_id,
+					$clover_order_id,
+					$card_summary
+				)
+				: sprintf(
+					/* translators: 1: Clover order ID  2: card summary */
+					__( 'Clover payment successful. Clover Order ID: %1$s%2$s', 'clover-gateway' ),
+					$clover_order_id,
+					$card_summary
+				)
 		);
 
 		return array(

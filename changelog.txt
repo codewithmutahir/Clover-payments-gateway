@@ -1,9 +1,12 @@
 *** Clover Payment Gateway for WooCommerce Changelog ***
 
 2026-10-13 - version 1.0.17
-* Fix - Card checkout was still creating two Clover orders because `/v1/charges` always auto-creates a Paid "Item 1" order, and a paid order cannot be deleted afterward. Card payments now create the same v3 order (real item names + taxes) used by COD/pickup, then pay that order with the documented `POST /v1/orders/{orderId}/pay` endpoint so Clover flips THAT ticket to Paid. No throwaway order, no External Payment tender required.
-* Fix - A failed card attempt that had already saved `_clover_order_id` was treated as success on retry (no charge). Retry now reuses the existing Clover ticket and only short-circuits when `_clover_charge_id` exists.
+* Fix - Card checkout was still creating two Clover orders because `/v1/charges` always auto-creates a Paid "Item 1" order, and a paid order cannot be deleted afterward. Card payments now create the same v3 order (real item names + taxes) used by COD/pickup, then pay that order with `POST /v1/orders/{orderId}/pay` so Clover flips THAT ticket to Paid. A standalone charge is used only when Clover rejects pay-for-order for a structural reason, and can be disabled with the `clover_gateway_allow_charge_fallback` filter.
+* Fix - A failed card attempt that had already saved `_clover_order_id` was treated as success on retry (no charge). Checkout only short-circuits when `_clover_charge_id` exists or the WooCommerce order is already paid.
+* Fix - When payment fails, delete the unpaid Clover order so the kitchen does not see an Open ticket. If the order already has a payment, or Clover cannot confirm that, the ticket is kept and the retry pays it instead of opening another.
+* Fix - Clear the idempotency key after a decline so a retry with a different card is charged instead of replaying the original response.
 * Fix - Persist Clover order/charge meta with WooCommerce CRUD methods so HPOS stores keep card and COD tickets from colliding.
+* Add - Order note when Clover reports a balance still due after payment, and when the card had to be charged on a separate unitemized order.
 * Note - COD/pickup is unchanged: one Open Clover order via `create_order_with_items()`, skipped for `clover_gateway`, no cash tender (cash is collected at pickup). Kitchen notes now include the WooCommerce payment method title so card vs pickup is obvious on the ticket.
 
 2026-10-09 - version 1.0.16
