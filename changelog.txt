@@ -1,5 +1,53 @@
 *** Clover Payment Gateway for WooCommerce Changelog ***
 
+2026-10-13 - version 1.0.17
+* Fix - Card checkout was still creating two Clover orders because `/v1/charges` always auto-creates a Paid "Item 1" order, and a paid order cannot be deleted afterward. Card payments now create the same v3 order (real item names + taxes) used by COD/pickup, then pay that order with the documented `POST /v1/orders/{orderId}/pay` endpoint so Clover flips THAT ticket to Paid. No throwaway order, no External Payment tender required.
+* Fix - A failed card attempt that had already saved `_clover_order_id` was treated as success on retry (no charge). Retry now reuses the existing Clover ticket and only short-circuits when `_clover_charge_id` exists.
+* Fix - Persist Clover order/charge meta with WooCommerce CRUD methods so HPOS stores keep card and COD tickets from colliding.
+* Note - COD/pickup is unchanged: one Open Clover order via `create_order_with_items()`, skipped for `clover_gateway`, no cash tender (cash is collected at pickup). Kitchen notes now include the WooCommerce payment method title so card vs pickup is obvious on the ticket.
+
+2026-10-09 - version 1.0.16
+* Fix - "External Payment" tender lookup only matched Clover's system labelKey (com.clover.tender.external_payment), but most merchant accounts never expose that as a toggle in Settings -> Payment Preferences -> Tenders; the only way to get an "External Payment" entry there is to add it as a CUSTOM tender, which has a merchant-generated id/label and no system labelKey. This meant record_external_card_payment() always failed to find it on those accounts, so the real order stayed Open and the throwaway order was kept as the fallback. get_external_payment_tender_id() now also falls back to a case-insensitive match on the tender's display label ("External Payment"), covering custom tenders created via the "Create custom tender" field. The custom tender label is filterable via `clover_gateway_external_payment_tender_label` in case a merchant names it differently.
+* Add - `get_merchant_tenders()` (cached per-request) and `get_tender_id_by_label()` in Clover_API.
+
+2026-10-09 - version 1.0.15
+* Fix - Root cause of the duplicate-order bug, for real this time: Clover's eCommerce `/v1/charges` endpoint ALWAYS auto-creates its own order for every charge (order_id in the request body does not link to an existing order), AND Clover auto-locks an order the instant it's paid — so the 1.0.13/1.0.14 approach of charging first and editing the auto-created order afterward could never work; the edit calls were silently rejected by the lock. Reworked the flow to create the real v3 order with proper line items FIRST, charge the card via the eCommerce API separately, then record that charge as an external payment directly on the real order via `POST /orders/{orderId}/payments` with the `com.clover.tender.external_payment` system tender + `externalPaymentId` (the same documented mechanism add_cash_tender() already uses for COD). The eCommerce API's throwaway "Item 1" order is deleted once the real order is confirmed paid.
+* Add - `record_external_card_payment()`, `get_external_payment_tender_id()`, `get_tender_id_by_label_key()` in Clover_API.
+* Note - Requires the merchant to have the "External Payment" tender enabled under Clover Setup → Tenders. If missing, the order stays Open and an order note explains how to fix it (payment is still captured — nothing is lost, just not reflected as Paid in Clover until the tender is enabled and the order is reconciled manually).
+
+2026-10-08 - version 1.0.14
+* Fix - 1.0.13's duplicate-order fix never actually populated the charge-created order: the auto-created order ID was read from the wrong response field (payment.order.id, which Clover's eCommerce API does not return) instead of the documented top-level `order` string field. This silently skipped populate_ecomm_order_with_items() every time, so the Paid order kept showing the generic "Item 1" line with no note. Fixed extraction to read `order` (string) first, with defensive fallbacks, and log the raw charge response when no order id can be found so this is diagnosable from WC > Status > Logs going forward.
+
+2026-10-07 - version 1.0.13
+* Fix - Duplicate Clover orders on card payments: the eCommerce `/v1/charges` API auto-creates its own order (generic "Item 1") even when an existing `order_id` is supplied. Reversed the flow to charge first, then populate the auto-created order with real WooCommerce line items, title, note and tax. Eliminates the Open + Paid duplicate pair.
+* Add - `populate_ecomm_order_with_items()` and `delete_order_line_items()` methods in Clover_API.
+* Add - `ecomm_order_id` field in `charge_card()` response for the auto-created order ID.
+
+2026-08-14 - version 1.0.12
+* Fix - Include WooCommerce customer note and theme order notes (_kr_order_notes) in Clover order note so kitchen tickets show special requests.
+* Fix - Read KR fulfillment meta (_kr_fulfillment_type, _kr_preferred_datetime) for pickup/delivery line on Clover note.
+* Add - Filter clover_gateway_order_note to customize POS/kitchen note text.
+
+2026-07-08 - version 1.0.11
+* Fix - Charge payload uses order_id + ecomind to match official Clover plugin and API docs.
+* Fix - Surface real Clover eCommerce error messages at checkout instead of generic failure text.
+* Fix - Accept charge success when status is succeeded/captured, not only paid=true.
+* Fix - test_mode defaults to off when unset (was incorrectly defaulting to sandbox).
+* Fix - Reset card token after checkout AJAX refresh so retries tokenize again.
+
+2026-07-08 - version 1.0.10
+* Fix - Bind checkout_place_order on form.checkout (WC triggerHandler does not bubble to document.body).
+* Fix - Match official plugin: transresult validation flag, merchantId in Clover SDK, form.submit() after token.
+* Fix - Reset token/validation when card iframe fields change.
+
+2026-07-08 - version 1.0.9
+* Fix - Checkout tokenization: hook WooCommerce checkout_place_order (not form submit) so clover_card_token is sent with AJAX checkout.
+* Fix - Read Clover createToken() result.token as string (clv_…) per SDK docs; accept nested .token.token as fallback.
+* Fix - Remount Clover iframes after updated_checkout when payment markup is replaced.
+
+2026-07-01 - version 1.0.8
+* Fix - Kitchen double-print: fire ORDER category only by default (was ORDER + RECEIPT). Use filter clover_gateway_print_categories to add RECEIPT if needed.
+
 2026-07-01 - version 1.0.7
 * Fix - Root cause of 1/1 on kitchen tickets: never send unitQty; expand each unit into its own ad-hoc line item (qty 2 = two lines). Enable Clover Setup → Group line items to merge on print.
 * Add - Post-sync audit logs order note if Clover still attaches catalog inventory or unitQty.
