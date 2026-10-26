@@ -263,7 +263,8 @@ body.clover-gateway-settings-page .clover-plugin-copyright a {
 	height: 24px;
 }
 
-.clover-sync-card #clover-export-bar {
+.clover-sync-card #clover-export-bar,
+.clover-sync-card #clover-stock-import-bar {
 	background: linear-gradient(90deg, #2563eb 0%, #3b82f6 100%);
 	height: 100%;
 	transition: width 0.35s ease;
@@ -353,6 +354,28 @@ body.clover-gateway-settings-page .clover-plugin-copyright a {
 	background: #fed7aa;
 	color: #9a3412;
 	border: 1px solid #fdba74;
+}
+
+.clover-badge-parent {
+	background: #e2e8f0;
+	color: #334155;
+	border: 1px solid #cbd5e1;
+}
+
+.clover-row-kind {
+	display: inline-block;
+	margin-left: 6px;
+	padding: 1px 6px;
+	border-radius: 4px;
+	background: #eef2ff;
+	color: #3730a3;
+	font-size: 11px;
+	font-weight: 600;
+	vertical-align: middle;
+}
+
+#clover-sync-filter-wrap {
+	margin-left: 8px;
 }
 
 .clover-badge-nomatch {

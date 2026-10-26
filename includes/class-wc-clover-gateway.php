@@ -121,6 +121,18 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 				'default'     => 'no',
 				'description' => __( 'Shows a debug metabox on each order: what we sent to Clover vs what Clover stored (qty, unitQty, printed). Use this to verify x1/0 issues without calling the restaurant.', 'clover-gateway' ),
 			),
+			'auto_print' => array(
+				'title'       => __( 'Automatic Kitchen Print', 'clover-gateway' ),
+				'type'        => 'checkbox',
+				'label'       => __( 'Fire a Clover print_event after each order is created', 'clover-gateway' ),
+				'default'     => 'yes',
+				'description' => __(
+					'DISABLE this if your Clover device already auto-prints incoming orders — for example via DineNGo, OrderOut, or Clover\'s own Setup → Order Receipts auto-print. '
+					. 'Leaving it on while another app also prints will cause double kitchen tickets. '
+					. 'The manual "Retry print" button on each order always fires regardless of this setting.',
+					'clover-gateway'
+				),
+			),
 		);
 	}
 
@@ -383,6 +395,7 @@ class WC_Clover_Gateway extends WC_Payment_Gateway
 			);
 		}
 
+		
 		if ( ! empty( $charge['amount_due'] ) ) {
 			$order->add_order_note(
 				sprintf(

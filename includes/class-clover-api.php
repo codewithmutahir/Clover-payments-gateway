@@ -583,31 +583,61 @@ class Clover_API
 	}
 
 	/**
+	 * Strip characters that thermal / ESC-POS printers render as garbage.
+	 *
+	 * Zero-width Unicode (ZWNJ, ZWSP, BOM, soft hyphen, word joiner) and most
+	 * C0/C1 controls print as random glyphs like "| 6s8" on Clover kitchen tickets.
+	 * Newlines and tabs are kept for order notes.
+	 *
+	 * @param string $text Raw text.
+	 * @return string Printer-safe text.
+	 */
+	protected function sanitize_printer_text( $text ) {
+		$text = (string) $text;
+
+		if ( '' === $text ) {
+			return $text;
+		}
+
+		// Zero-width / invisible Unicode that printers cannot render.
+		$text = preg_replace( '/[\x{200B}-\x{200D}\x{2060}\x{FEFF}\x{00AD}]/u', '', $text );
+
+		// Control chars except TAB / LF / CR.
+		$text = preg_replace( '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $text );
+
+		return is_string( $text ) ? $text : '';
+	}
+
+	/**
 	 * Build a kitchen-safe ad-hoc line item name.
 	 *
-	 * Clover POS auto-matches line item names to catalog inventory. When "Tuesday Deal"
-	 * matches a kitchen-tracked inventory item, POS shows x1/1 (fired/total) instead of x1.
-	 * An invisible zero-width character breaks exact matching without changing the ticket.
+	 * Names must be plain printable text — do not inject zero-width or other
+	 * "invisible" Unicode to break Clover catalog matching; thermal printers
+	 * render those bytes as garbage (e.g. "C| 6s8hicken" instead of "Chicken").
+	 * Catalog 1/1 / x1/1 is already avoided by sending ad-hoc lines (no item.id)
+	 * and never sending unitQty (one API line per unit).
 	 *
 	 * @param string $name     WooCommerce product name.
 	 * @param int    $quantity Line quantity.
 	 * @return string
 	 */
 	protected function clover_kitchen_line_name( $name, $quantity ) {
-		$name = (string) $name;
+		$name = $this->sanitize_printer_text( (string) $name );
+		$collapsed = preg_replace( '/\s+/u', ' ', $name );
+		$name      = trim( is_string( $collapsed ) ? $collapsed : $name );
 
-		if ( '' === $name ) {
-			return $name;
-		}
+		/**
+		 * Filter the Clover kitchen / receipt line item name.
+		 *
+		 * Return only printable text — zero-width Unicode will garble thermal prints.
+		 *
+		 * @param string $name     Sanitized product name.
+		 * @param int    $quantity Line quantity (always 1 for per-unit expansion).
+		 */
+		$filtered = (string) apply_filters( 'clover_gateway_kitchen_line_name', $name, $quantity );
 
-		// Zero-width non-joiner (U+200C) after first character — invisible on printers.
-		if ( function_exists( 'mb_substr' ) ) {
-			$name = mb_substr( $name, 0, 1 ) . "\u{200C}" . mb_substr( $name, 1 );
-		} else {
-			$name = substr( $name, 0, 1 ) . "\u{200C}" . substr( $name, 1 );
-		}
-
-		return apply_filters( 'clover_gateway_kitchen_line_name', $name, $quantity );
+		// Re-sanitize so a filter cannot reintroduce unprintable Unicode onto tickets.
+		return trim( $this->sanitize_printer_text( $filtered ) );
 	}
 
 	/**
@@ -997,6 +1027,12 @@ class Clover_API
 				$li['itemCode'],
 				$li['alternateName']
 			);
+
+			// Ensure names stay printer-safe on every sync path (atomic + sequential).
+			if ( isset( $li['name'] ) ) {
+				$li['name'] = trim( $this->sanitize_printer_text( (string) $li['name'] ) );
+			}
+
 			$clean[] = $li;
 		}
 
@@ -1121,7 +1157,9 @@ class Clover_API
 		 * @param WC_Order $order WooCommerce order.
 		 */
 		$note = implode( "\n", $note_lines );
-		return (string) apply_filters( 'clover_gateway_order_note', $note, $order );
+		$note = (string) apply_filters( 'clover_gateway_order_note', $note, $order );
+
+		return $this->sanitize_printer_text( $note );
 	}
 
 	/**
@@ -2638,15 +2676,25 @@ class Clover_API
 	}
 
 	/**
-	 * Print order tickets via Clover's documented print_event REST API.
+	 * Fire a Clover print_event for a newly created order.
 	 *
-	 * Sends one print_event per category (default: ORDER kitchen ticket only).
-	 * Records per-category print timestamps as order meta and adds a WC order
-	 * note when any category fails so the merchant has visibility.
+	 * Respects the "Automatic Kitchen Print" setting. Merchants whose Clover
+	 * device already auto-prints (via DineNGo, OrderOut, or Clover's native
+	 * Setup → Order Receipts auto-print) should disable this setting to avoid
+	 * duplicate kitchen tickets. The manual "Retry print" button on each order
+	 * always fires regardless of this setting (it calls send_print_event()
+	 * directly).
+	 *
+	 * We can't auto-detect whether another app will print the order:
+	 *   - Clover's REST API does not expose a list of installed apps.
+	 *   - Third-party apps like DineNGo use their own printing pipeline and do
+	 *     not update Clover's lineItem.printed flag, so a before-fire check
+	 *     against that flag is unreliable.
 	 *
 	 * @param string   $clover_order_id Clover order ID.
 	 * @param int|null $wc_order_id     WooCommerce order ID (for notes + meta).
-	 * @return bool True when all requested print categories succeed.
+	 * @param bool     $used_sequential Whether the sequential line-item path was used.
+	 * @return bool True on success (or when deliberately skipped).
 	 */
 	public function fire_order( $clover_order_id, $wc_order_id = null, $used_sequential = false ) {
 		if ( empty( $clover_order_id ) ) {
@@ -2660,11 +2708,58 @@ class Clover_API
 			$used_sequential ? 'yes' : 'no'
 		) );
 
+		// Setting: "Automatic Kitchen Print" — merchants with a Clover printing
+		// app installed (DineNGo, OrderOut, etc.) disable this to prevent dupes.
+		$settings  = get_option( 'woocommerce_clover_gateway_settings', array() );
+		$auto_print = is_array( $settings ) && isset( $settings['auto_print'] )
+			? ( 'yes' === $settings['auto_print'] )
+			: true; // default ON for backward compatibility
+
 		/**
-		 * Print categories for API-created orders.
+		 * Last-chance filter to override the auto-print setting per-order.
 		 *
-		 * @param string[] $categories e.g. array( 'ORDER' ) or array( 'ORDER', 'RECEIPT' ).
+		 * @param bool     $auto_print       Whether to fire print_event automatically.
+		 * @param string   $clover_order_id  Clover order ID.
+		 * @param int|null $wc_order_id      WooCommerce order ID.
 		 */
+		$auto_print = (bool) apply_filters( 'clover_gateway_auto_print', $auto_print, $clover_order_id, $wc_order_id );
+
+		if ( ! $auto_print ) {
+			$this->log( sprintf(
+				'fire_order() SKIPPED — Automatic Kitchen Print is OFF (device/app handles printing). clover_order=%s wc_order=%s',
+				$clover_order_id,
+				$wc_order_id ? $wc_order_id : 'null'
+			) );
+			return true;
+		}
+
+		// Guard: skip if this plugin already fired print for this WC order.
+		if ( $wc_order_id ) {
+			$wc_order = wc_get_order( $wc_order_id );
+			if ( $wc_order && $wc_order->get_meta( '_clover_print_fired_order' ) ) {
+				$this->log( sprintf(
+					'fire_order() SKIPPED — already printed by plugin: clover_order=%s wc_order=%s',
+					$clover_order_id,
+					$wc_order_id
+				) );
+				return true;
+			}
+		}
+
+		return $this->send_print_event( $clover_order_id, $wc_order_id );
+	}
+
+	/**
+	 * Send the actual print_event API call(s). Bypasses the auto_print setting
+	 * — used by fire_order() (after the setting check) and by the manual
+	 * "Retry print" admin button.
+	 *
+	 * @param string   $clover_order_id Clover order ID.
+	 * @param int|null $wc_order_id     WooCommerce order ID.
+	 * @return bool True when all categories succeed.
+	 */
+	public function send_print_event( $clover_order_id, $wc_order_id = null ) {
+		/** @var string[] $categories */
 		$categories = apply_filters( 'clover_gateway_print_categories', array( 'ORDER' ) );
 		if ( empty( $categories ) ) {
 			return false;
@@ -2672,15 +2767,12 @@ class Clover_API
 
 		$any_success       = false;
 		$failed_categories = array();
-
-		// Wait for Clover to commit line items before print. Sequential path already slept 2s.
-		if ( ! $used_sequential ) {
-			usleep( 1500000 ); // 1.5 seconds for atomic orders
-		}
+		$wc_order          = null;
 
 		foreach ( $categories as $category ) {
-			// Delay between print categories when more than one is requested.
-			usleep( 800000 ); // 800ms
+			if ( $any_success ) {
+				usleep( 800000 );
+			}
 
 			$result = $this->request_v3(
 				'POST',
@@ -2701,7 +2793,11 @@ class Clover_API
 				) );
 
 				if ( $wc_order_id ) {
-					update_post_meta( $wc_order_id, '_clover_print_fired_' . strtolower( $category ), current_time( 'mysql' ) );
+					$wc_order = $wc_order ?: wc_get_order( $wc_order_id );
+					if ( $wc_order ) {
+						$wc_order->update_meta_data( '_clover_print_fired_' . strtolower( $category ), current_time( 'mysql' ) );
+						$wc_order->save();
+					}
 				}
 			} else {
 				$failed_categories[] = $category;
@@ -2714,14 +2810,21 @@ class Clover_API
 			}
 		}
 
-		if ( ! empty( $failed_categories ) && $wc_order_id ) {
-			$wc_order = wc_get_order( $wc_order_id );
+		if ( $any_success && $wc_order_id ) {
+			$wc_order = $wc_order ?: wc_get_order( $wc_order_id );
 			if ( $wc_order ) {
-				$cats_string = implode( ', ', $failed_categories );
+				$wc_order->update_meta_data( '_clover_print_fired_order', 'plugin:' . current_time( 'mysql' ) );
+				$wc_order->save();
+			}
+		}
+
+		if ( ! empty( $failed_categories ) && $wc_order_id ) {
+			$wc_order = $wc_order ?: wc_get_order( $wc_order_id );
+			if ( $wc_order ) {
 				$wc_order->add_order_note(
 					sprintf(
 						'Clover print failed for: %1$s. Clover order ID: %2$s. Ensure your Clover device is online. <a href="#" class="clover-retry-print" data-order-id="%3$d">Retry print</a>',
-						esc_html( $cats_string ),
+						esc_html( implode( ', ', $failed_categories ) ),
 						esc_html( $clover_order_id ),
 						$wc_order_id
 					),
@@ -2732,6 +2835,165 @@ class Clover_API
 		}
 
 		return empty( $failed_categories ) && $any_success;
+	}
+
+	/**
+	 * Fetch every item-stock record for this merchant.
+	 *
+	 * Keyed by Clover item ID. Items with no numeric quantity are omitted so the
+	 * importer can leave those WooCommerce products unchanged.
+	 *
+	 * @return array{success:bool,stocks?:array<string,int|float>,message?:string}
+	 */
+	public function get_all_item_stocks()
+	{
+		$stocks = array();
+		$offset = 0;
+		$limit  = 100;
+		$pages  = 0;
+
+		do {
+			++$pages;
+			if ( $pages > 500 ) {
+				return array(
+					'success' => false,
+					'message' => __( 'Clover returned more item-stock pages than this import can read.', 'clover-gateway' ),
+				);
+			}
+
+			$result = $this->request_v3(
+				'GET',
+				'/merchants/' . rawurlencode( $this->merchant_id ) . '/item_stocks',
+				array(),
+				array(
+					'limit'  => $limit,
+					'offset' => $offset,
+					'expand' => 'item',
+				)
+			);
+
+			if ( empty( $result['success'] ) ) {
+				return array(
+					'success' => false,
+					'message' => ! empty( $result['message'] )
+						? (string) $result['message']
+						: __( 'Could not read Clover item stock.', 'clover-gateway' ),
+				);
+			}
+
+			$elements = array();
+			if ( ! empty( $result['data']['elements'] ) && is_array( $result['data']['elements'] ) ) {
+				$elements = $result['data']['elements'];
+			}
+
+			foreach ( $elements as $row ) {
+				if ( ! is_array( $row ) ) {
+					continue;
+				}
+
+				$item_id = '';
+				if ( ! empty( $row['item']['id'] ) ) {
+					$item_id = (string) $row['item']['id'];
+				} elseif ( ! empty( $row['id'] ) ) {
+					$item_id = (string) $row['id'];
+				}
+				$item_id = trim( $item_id );
+				if ( '' === $item_id ) {
+					continue;
+				}
+
+				if ( array_key_exists( 'quantity', $row ) && is_numeric( $row['quantity'] ) ) {
+					$stocks[ $item_id ] = 0 + $row['quantity'];
+				} elseif ( ! array_key_exists( 'quantity', $row ) && array_key_exists( 'stockCount', $row ) && is_numeric( $row['stockCount'] ) ) {
+					$stocks[ $item_id ] = 0 + $row['stockCount'];
+				}
+			}
+
+			$offset += $limit;
+		} while ( count( $elements ) === $limit );
+
+		return array(
+			'success' => true,
+			'stocks'  => $stocks,
+		);
+	}
+
+	/**
+	 * Read one item's stock quantity.
+	 *
+	 * A missing stock record means Clover is not tracking that item. The quantity
+	 * is null in that case so a sale is not written as zero.
+	 *
+	 * @param string $item_id Clover item ID.
+	 * @return array{success:bool,quantity?:int|float|null,tracked?:bool,message?:string}
+	 */
+	public function get_item_stock_quantity( $item_id )
+	{
+		$result = $this->request_v3(
+			'GET',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/item_stocks/' . rawurlencode( $item_id )
+		);
+
+		if ( empty( $result['success'] ) ) {
+			$code = isset( $result['http_code'] ) ? (int) $result['http_code'] : 0;
+			if ( 404 === $code ) {
+				return array(
+					'success'  => true,
+					'quantity' => null,
+					'tracked'  => false,
+				);
+			}
+			return array(
+				'success' => false,
+				'message' => ! empty( $result['message'] ) ? (string) $result['message'] : __( 'Could not read Clover stock.', 'clover-gateway' ),
+			);
+		}
+
+		$data = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+		if ( array_key_exists( 'quantity', $data ) && is_numeric( $data['quantity'] ) ) {
+			return array(
+				'success'  => true,
+				'quantity' => 0 + $data['quantity'],
+				'tracked'  => true,
+			);
+		}
+		if ( array_key_exists( 'stockCount', $data ) && is_numeric( $data['stockCount'] ) ) {
+			return array(
+				'success'  => true,
+				'quantity' => 0 + $data['stockCount'],
+				'tracked'  => true,
+			);
+		}
+
+		return array(
+			'success'  => true,
+			'quantity' => null,
+			'tracked'  => false,
+		);
+	}
+
+	/**
+	 * Set one item's stock quantity.
+	 *
+	 * @param string    $item_id  Clover item ID.
+	 * @param int|float $quantity New absolute quantity.
+	 * @return array
+	 */
+	public function set_item_stock_quantity( $item_id, $quantity )
+	{
+		$path   = '/merchants/' . rawurlencode( $this->merchant_id ) . '/item_stocks/' . rawurlencode( $item_id );
+		$body   = array( 'quantity' => $quantity );
+		$result = $this->request_v3( 'PUT', $path, $body );
+		if ( ! empty( $result['success'] ) ) {
+			return $result;
+		}
+
+		$code = isset( $result['http_code'] ) ? (int) $result['http_code'] : 0;
+		if ( in_array( $code, array( 404, 405 ), true ) ) {
+			$result = $this->request_v3( 'POST', $path, $body );
+		}
+
+		return $result;
 	}
 
 	/**

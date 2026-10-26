@@ -6,7 +6,7 @@
  * Requires Plugins: woocommerce
  * Author: Elite Solution USA
  * Author URI: https://elitesolutionusa.com
- * Version: 1.0.17
+ * Version: 1.0.25
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Text Domain: clover-gateway
@@ -43,6 +43,10 @@ function clover_gateway_on_activate() {
  */
 function clover_gateway_on_deactivate() {
 	wp_clear_scheduled_hook( 'clover_license_weekly_verify' );
+	wp_clear_scheduled_hook( 'clover_gateway_reconcile_stock' );
+	if ( function_exists( 'as_unschedule_all_actions' ) ) {
+		as_unschedule_all_actions( 'clover_gateway_reconcile_stock', array(), 'clover-gateway' );
+	}
 }
 
 register_activation_hook( __FILE__, 'clover_gateway_on_activate' );
@@ -127,7 +131,7 @@ class Clover_Gateway_Plugin {
 	 */
 	protected function define_constants() {
 		if ( ! defined( 'WC_CLOVER_GATEWAY_VERSION' ) ) {
-			define( 'WC_CLOVER_GATEWAY_VERSION', '1.0.17' );
+			define( 'WC_CLOVER_GATEWAY_VERSION', '1.0.25' );
 		}
 
 		if ( ! defined( 'WC_CLOVER_GATEWAY_PLUGIN_FILE' ) ) {

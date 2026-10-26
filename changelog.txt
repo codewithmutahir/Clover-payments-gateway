@@ -1,5 +1,34 @@
 *** Clover Payment Gateway for WooCommerce Changelog ***
 
+2026-10-26 - version 1.0.25
+* Fix - Kitchen/receipt tickets showing garbage inside product names (e.g. "C| 6s8hicken" instead of "Chicken"). The previous kitchen-safe name hack inserted a zero-width non-joiner (U+200C) that thermal printers cannot render. Names are now plain printable text only.
+* Fix - Strip zero-width / control characters from all Clover line item names and order notes before sync so product titles or customer notes cannot leak unprintable Unicode onto tickets.
+* Note - Catalog 1/1 quantity display is still prevented by ad-hoc lines (no item.id) and omitting unitQty; do not reintroduce invisible Unicode into line names.
+
+2026-10-21 - version 1.0.24
+* Add - Setting "Automatic Kitchen Print" under WooCommerce → Settings → Payments → Clover Payments. Default ON (prints via Clover print_event API after each order). Disable it if the Clover device already auto-prints incoming orders — for example via a Clover marketplace app (DineNGo, OrderOut, etc.) or Clover's native Setup → Order Receipts auto-print. Leaving it on while another app also prints causes double kitchen tickets.
+* Add - Filter clover_gateway_auto_print to override the setting per-order.
+* Note - The deferred-print / auto-detect approach from 1.0.23 is removed. Clover's REST API does not expose installed apps, and third-party print apps like DineNGo use their own printing pipeline that does not update Clover's lineItem.printed flag, so no reliable auto-detection is possible.
+* Fix - HPOS: print-fired meta uses WC_Order CRUD instead of update_post_meta().
+* Fix - Guard against double-fire within the plugin: fire_order() checks the _clover_print_fired_order meta and skips if the plugin already printed this order.
+* Note - Manual "Retry print" button on each order always fires regardless of the Automatic Kitchen Print setting.
+
+2026-10-14 - version 1.0.22
+* Add - A website order that reduces WooCommerce stock also reduces the linked Clover item by the quantity sold. Cancelling or refunding that order puts the quantity back. The change is recorded on the order line so a retry does not apply it twice. Items Clover is not tracking are left unchanged and noted on the order.
+
+2026-10-14 - version 1.0.21
+* Add - Variations such as Full Tray and Half tray auto-match the single Clover item named like the dish, and both keep that same quantity. A size-specific Clover item is still preferred when its name includes the size.
+* Add - Optional stock check every 15 minutes copies Clover quantities onto linked WooCommerce products. Leave it off until the links have been reviewed.
+
+2026-10-14 - version 1.0.20
+* Fix - Clicking Link on the match table saved the Clover item, but a reload showed the old Possible Match again because the page was still rendering the dry-sync snapshot. Saved links and skips are now written back into that snapshot, and a reload checks the product meta before showing the row.
+
+2026-10-14 - version 1.0.19
+* Add - Clover Sync matches each WooCommerce variation to its own Clover item by SKU or by parent name plus attribute (for example "Biryani Large"). Variable parents stay in the list as a reminder that parent links do not set variation stock. An automatic link is withheld when two products would claim the same Clover item. Filter the match table to variations, then apply auto-links and import stock again.
+
+2026-10-14 - version 1.0.18
+* Add - WooCommerce → Clover Sync can import stock quantities from Clover onto products that already have a Clover item ID. Images, descriptions, prices, and URLs are not changed. Items with no Clover stock count are left unchanged. Variable parent products are skipped so each variation can be linked on its own.
+
 2026-10-13 - version 1.0.17
 * Fix - Card checkout was still creating two Clover orders because `/v1/charges` always auto-creates a Paid "Item 1" order, and a paid order cannot be deleted afterward. Card payments now create the same v3 order (real item names + taxes) used by COD/pickup, then pay that order with `POST /v1/orders/{orderId}/pay` so Clover flips THAT ticket to Paid. A standalone charge is used only when Clover rejects pay-for-order for a structural reason, and can be disabled with the `clover_gateway_allow_charge_fallback` filter.
 * Fix - A failed card attempt that had already saved `_clover_order_id` was treated as success on retry (no charge). Checkout only short-circuits when `_clover_charge_id` exists or the WooCommerce order is already paid.

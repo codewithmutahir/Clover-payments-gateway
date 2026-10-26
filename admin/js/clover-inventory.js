@@ -63,6 +63,110 @@
 		});
 	}
 
+	function escapeHtml(str) {
+		return $('<span>').text(str == null ? '' : String(str)).html();
+	}
+
+	// ── STOCK IMPORT ────────────────────────────────────────────────────
+
+	var stockTotals = { updated: 0, unchanged: 0, untracked: 0, skipped_parent: 0, errors: 0 };
+	var stockNotes = [];
+
+	function showStockMsg(html, type) {
+		$('#clover-stock-import-message').html('<div class="notice notice-' + type + '" style="margin-top:12px"><p>' + html + '</p></div>');
+	}
+
+	function finishStockImport() {
+		$('#clover-start-stock-import').prop('disabled', false);
+		$('#clover-stock-import-spinner').removeClass('is-active');
+	}
+
+	function stockSummaryHtml() {
+		var html = 'Import complete. Updated: <strong>' + stockTotals.updated + '</strong>' +
+			' &nbsp;|&nbsp; Already in sync: <strong>' + stockTotals.unchanged + '</strong>' +
+			' &nbsp;|&nbsp; No Clover stock count: <strong>' + stockTotals.untracked + '</strong>' +
+			' &nbsp;|&nbsp; Variable products skipped: <strong>' + stockTotals.skipped_parent + '</strong>' +
+			' &nbsp;|&nbsp; Errors: <strong>' + stockTotals.errors + '</strong>';
+
+		if (stockTotals.untracked > 0) {
+			html += '<br>Those items have no stock count in Clover, so their WooCommerce quantity was left as it is.';
+		}
+		if (stockTotals.skipped_parent > 0) {
+			html += '<br>Variable products were skipped. Link each variation, then import again.';
+		}
+		if (stockNotes.length) {
+			html += '<br>' + stockNotes.map(escapeHtml).join('<br>');
+		}
+		return html;
+	}
+
+	function runStockBatch(offset, token) {
+		$.post(clover_sync_params.ajax_url, {
+			action: 'clover_import_stock_batch',
+			nonce: clover_sync_params.nonce,
+			offset: offset,
+			token: token || ''
+		}).done(function (res) {
+			if (!res.success) {
+				showStockMsg(escapeHtml(res.data && res.data.message ? res.data.message : 'Stock import failed.'), 'error');
+				finishStockImport();
+				return;
+			}
+
+			var d = res.data || {};
+			if (d.empty) {
+				$('#clover-stock-import-progress').hide();
+				showStockMsg('No WooCommerce products are linked to a Clover item yet. Match products below, then import stock.', 'warning');
+				finishStockImport();
+				return;
+			}
+
+			stockTotals.updated += d.updated || 0;
+			stockTotals.unchanged += d.unchanged || 0;
+			stockTotals.untracked += d.untracked || 0;
+			stockTotals.skipped_parent += d.skipped_parent || 0;
+			stockTotals.errors += d.errors || 0;
+			if (d.messages && d.messages.length) {
+				stockNotes = stockNotes.concat(d.messages).slice(0, 12);
+			}
+
+			var pct = d.total > 0 ? Math.min(100, Math.round((d.processed / d.total) * 100)) : 100;
+			$('#clover-stock-import-bar').css('width', pct + '%');
+			$('#clover-stock-import-progress-text').text(
+				'Processed ' + d.processed + ' of ' + d.total +
+				' — Updated: ' + stockTotals.updated +
+				', Already in sync: ' + stockTotals.unchanged +
+				', No Clover count: ' + stockTotals.untracked +
+				', Errors: ' + stockTotals.errors
+			);
+
+			if (d.done) {
+				showStockMsg(stockSummaryHtml(), stockTotals.errors > 0 ? 'warning' : 'success');
+				finishStockImport();
+			} else {
+				runStockBatch(d.next_offset, d.token);
+			}
+		}).fail(function () {
+			showStockMsg('Request failed. Check your connection and try again.', 'error');
+			finishStockImport();
+		});
+	}
+
+	$('#clover-start-stock-import').on('click', function () {
+		var $btn = $(this);
+		confirmModal('This will set WooCommerce stock quantities from Clover for every linked product. Images, descriptions, and prices will not be changed. Continue?', function () {
+			stockTotals = { updated: 0, unchanged: 0, untracked: 0, skipped_parent: 0, errors: 0 };
+			stockNotes = [];
+			$btn.prop('disabled', true);
+			$('#clover-stock-import-spinner').addClass('is-active');
+			$('#clover-stock-import-message').html('');
+			$('#clover-stock-import-bar').css('width', '0%');
+			$('#clover-stock-import-progress-text').text('Reading Clover stock\u2026');
+			$('#clover-stock-import-progress').show();
+			runStockBatch(0, '');
+		});
+	});
+
 	// ── EXPORT SECTION ──────────────────────────────────────────────────
 
 	// Load tax rates from Clover into the selector.
@@ -191,6 +295,26 @@
 		$row.find('.clover-action-cell').html('&mdash;');
 	}
 
+	function applySyncFilter() {
+		var mode = $('#clover-sync-filter').val() || 'all';
+		$('#clover-sync-table tbody tr').each(function () {
+			var $tr = $(this);
+			var status = $tr.attr('data-status');
+			var type = $tr.attr('data-type');
+			var show = true;
+			if (mode === 'variations') {
+				show = type === 'variation';
+			} else if (mode === 'parents') {
+				show = status === 'parent_only';
+			} else if (mode === 'actionable') {
+				show = status === 'auto_linked' || status === 'needs_review' || status === 'possible_match' || status === 'no_match';
+			}
+			$tr.toggle(show);
+		});
+	}
+
+	$('#clover-sync-filter').on('change', applySyncFilter);
+
 	// Run dry sync
 	$('#clover-run-dry-sync').on('click', function () {
 		var $btn = $(this);
@@ -210,10 +334,13 @@
 				$('#stat-needs_review').text(d.counts.needs_review);
 				$('#stat-possible_match').text(d.counts.possible_match);
 				$('#stat-no_match').text(d.counts.no_match);
+				$('#stat-variations').text(d.counts.variations || 0);
+				$('#stat-parent_only').text(d.counts.parent_only || 0);
 
 				$('#clover-sync-table tbody').html(d.rows_html);
-				$('#clover-sync-overview, #clover-sync-table, #clover-apply-auto').show();
-				showMsg('Dry sync complete. Review results below.', 'success');
+				$('#clover-sync-overview, #clover-sync-table, #clover-apply-auto, #clover-sync-filter-wrap').show();
+				applySyncFilter();
+				showMsg('Dry sync complete. Variations are listed under each parent. Apply auto-links, then import stock again.', 'success');
 			} else {
 				showMsg(res.data && res.data.message ? res.data.message : 'Sync failed.', 'error');
 			}
@@ -240,6 +367,7 @@
 				$('#clover-sync-table tbody tr[data-status="auto_linked"]').each(function () {
 					setRowLinked($(this));
 				});
+				applySyncFilter();
 			} else {
 				showMsg('Failed to apply auto-links.', 'error');
 			}
@@ -254,8 +382,8 @@
 	// Link single product
 	$(document).on('click', '.clover-action-link', function () {
 		var $btn = $(this);
-		var pid = $btn.data('pid');
-		var cid = $btn.data('cid');
+		var pid = $btn.attr('data-pid');
+		var cid = $btn.attr('data-cid');
 		$btn.prop('disabled', true);
 
 		$.post(clover_sync_params.ajax_url, {
