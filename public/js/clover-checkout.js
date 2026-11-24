@@ -1,176 +1,292 @@
+/**
+ * Clover checkout tokenization — aligned with official Clover Payments for WooCommerce.
+ *
+ * WooCommerce calls triggerHandler( 'checkout_place_order' ) on form.checkout only;
+ * handlers on document.body never run. Token must be set before form.submit().
+ *
+ * @package clover-gateway
+ */
 /* global wc_clover_params, jQuery, Clover */
 
-(function ($) {
+jQuery(function ($) {
 	'use strict';
 
-	var cloverInstance = null;
-	var cloverElements = null;
-	var cardNumber, cardDate, cardCvv, cardZip;
-	var isTokenizing = false;
+	var cloverGateway = {
+		form: null,
+		clover: null,
 
-	function initClover() {
-		if (cloverInstance || typeof Clover === 'undefined') {
-			return;
-		}
+		init: function () {
+			this.initFormEvents();
 
-		if (!wc_clover_params || !wc_clover_params.public_key) {
-			return;
-		}
+			$(document.body).on('updated_checkout', function () {
+				// Always reset after checkout refresh so a failed attempt cannot reuse a spent token.
+				cloverGateway.resetValidationFlag();
+				$('input[name="clover_card_token"]').val('');
 
-		cloverInstance = new Clover(wc_clover_params.public_key, {
-			locale: 'en-US'
-		});
+				if (!document.querySelector('#clover-card-number iframe')) {
+					cloverGateway.initCloverElement();
+				}
+			});
 
-		cloverElements = cloverInstance.elements();
+			// Mount iframes on first checkout load (updated_checkout may not have fired yet).
+			if ($('form.checkout').length && !document.querySelector('#clover-card-number iframe')) {
+				cloverGateway.initCloverElement();
+			}
 
-		var cloverStyles = {
-			body: {
-				fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-				fontSize: '14px',
-				margin: '0',
-				padding: '0',
-			},
-			label: {
-				display: 'none',
-			},
-			input: {
-				fontSize: '14px',
-				padding: '0',
-				margin: '0',
-				height: '24px',
-				lineHeight: '24px',
-				border: 'none',
-				boxShadow: 'none',
-				backgroundColor: 'transparent',
-			},
-		};
+			if ($('form#order_review').length && !document.querySelector('#clover-card-number iframe')) {
+				cloverGateway.initCloverElement();
+			}
+		},
 
-		cardNumber = cloverElements.create('CARD_NUMBER', cloverStyles);
-		cardDate = cloverElements.create('CARD_DATE', cloverStyles);
-		cardCvv = cloverElements.create('CARD_CVV', cloverStyles);
-		cardZip = cloverElements.create('CARD_POSTAL_CODE', cloverStyles);
+		initFormEvents: function () {
+			if ($('form#order_review').length) {
+				this.form = $('form#order_review');
+				$(document.body).trigger('wc-credit-card-form-init');
+				this.form.on('submit', function () {
+					if (!cloverGateway.ifWeChosen()) {
+						return true;
+					}
+					if (!cloverGateway.isValidated()) {
+						cloverGateway.onSubmit();
+						return false;
+					}
+					return true;
+				});
+			}
 
-		cardNumber.mount('#clover-card-number');
-		cardDate.mount('#clover-card-date');
-		cardCvv.mount('#clover-card-cvv');
-		cardZip.mount('#clover-card-zip');
-	}
+			if ($('form.woocommerce-checkout').length) {
+				this.form = $('form.checkout');
 
-	function resetCheckoutForm($form) {
-		$form.data('clover-tokenizing', false);
-		$form.removeClass('processing');
-		if ($.fn.unblock) {
-			$form.unblock();
-		}
-	}
+				// Must bind directly on form.checkout — WC uses triggerHandler (no bubbling).
+				this.form.on('checkout_place_order', function () {
+					if (!cloverGateway.ifWeChosen()) {
+						return true;
+					}
+					if (!cloverGateway.isValidated()) {
+						cloverGateway.onSubmit();
+						return false;
+					}
+					return true;
+				});
+			}
+		},
 
-	function showCheckoutError($form, message) {
-		$('.woocommerce-NoticeGroup-checkout').remove();
-		var $notice = $('<div>', {
-			class: 'woocommerce-NoticeGroup woocommerce-NoticeGroup-checkout'
-		});
-		var $list = $('<ul>', {
-			class: 'woocommerce-error',
-			role: 'alert'
-		});
-		$list.append($('<li>').text(message));
-		$notice.append($list);
-		$form.prepend($notice);
-		$('html, body').animate({ scrollTop: $form.offset().top - 100 }, 300);
-	}
+		ifWeChosen: function () {
+			return $('#payment_method_' + wc_clover_params.gateway_id).is(':checked');
+		},
 
-	function ensureTokenAndSubmit($form) {
-		if (isTokenizing) {
-			return false;
-		}
+		isValidated: function () {
+			var trans = document.getElementById('clover-transresult');
+			return trans && trans.value === '1';
+		},
 
-		var tokenField = $form.find('input[name="clover_card_token"]');
-		if (tokenField.val()) {
-			// Token already present; allow submission.
-			$form.off('submit.clover_gateway');
-			$form.submit();
-			return false;
-		}
+		resetValidationFlag: function () {
+			var trans = document.getElementById('clover-transresult');
+			if (trans) {
+				trans.value = '0';
+			}
+		},
 
-		isTokenizing = true;
+		getPublicKey: function () {
+			return wc_clover_params.public_key;
+		},
 
-		cloverInstance.createToken().then(function (result) {
-			isTokenizing = false;
+		getMerchantId: function () {
+			return wc_clover_params.merchant_id || '';
+		},
 
-			if (result && result.token && result.token.token) {
-				tokenField.val(result.token.token);
-				$form.off('submit.clover_gateway');
-				$form.submit();
+		getLocale: function () {
+			var locale = wc_clover_params.locale || 'en-US';
+			return locale.replace('_', '-');
+		},
+
+		initCloverElement: function () {
+			if (typeof Clover === 'undefined' || !this.getPublicKey()) {
 				return;
 			}
 
-			// No valid token (empty fields or invalid card): submit as COD/order-only.
-			tokenField.val('order_only');
-			$form.off('submit.clover_gateway');
-			$form.submit();
-		}).catch(function (err) {
-			isTokenizing = false;
-			resetCheckoutForm($form);
+			var options = {
+				locale: this.getLocale(),
+			};
 
-			var message = wc_clover_params.error_generic || 'Payment could not be processed. Please try again.';
-			if (err && err.message) {
-				message = err.message;
-			} else if (wc_clover_params.error_invalid) {
-				message = wc_clover_params.error_invalid;
+			if (this.getMerchantId()) {
+				options.merchantId = this.getMerchantId();
 			}
 
-			showCheckoutError($form, message);
-		});
+			this.clover = new Clover(this.getPublicKey(), options);
+			var elements = this.clover.elements();
 
-		return false;
-	}
+			var styles = {
+				body: {
+					fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+					fontSize: '14px',
+					margin: '0',
+					padding: '0',
+				},
+				label: {
+					display: 'none',
+				},
+				input: {
+					fontSize: '14px',
+					padding: '0',
+					margin: '0',
+					height: '24px',
+					lineHeight: '24px',
+					border: 'none',
+					boxShadow: 'none',
+					backgroundColor: 'transparent',
+				},
+			};
 
-	$(document).on('wc-credit-card-form-init', function () {
-		initClover();
-	});
+			var cardNumber = elements.create('CARD_NUMBER', styles);
+			var cardDate = elements.create('CARD_DATE', styles);
+			var cardCvv = elements.create('CARD_CVV', styles);
+			var cardZip = elements.create('CARD_POSTAL_CODE', styles);
 
-	$(document.body).on('updated_checkout', function () {
-		initClover();
-	});
+			cardNumber.mount('#clover-card-number');
+			cardDate.mount('#clover-card-date');
+			cardCvv.mount('#clover-card-cvv');
+			cardZip.mount('#clover-card-zip');
 
-	$(document).on('submit.clover_gateway', 'form.checkout', function (e) {
-		var $form = $(this);
+			var resetOnChange = function () {
+				cloverGateway.resetValidationFlag();
+				$('input[name="clover_card_token"]').val('');
+			};
 
-		// Only for our gateway.
-		var selectedGateway = $form.find('input[name="payment_method"]:checked').val();
-		if (selectedGateway !== wc_clover_params.gateway_id) {
-			return true;
-		}
+			cardNumber.addEventListener('change', resetOnChange);
+			cardDate.addEventListener('change', resetOnChange);
+			cardCvv.addEventListener('change', resetOnChange);
+			cardZip.addEventListener('change', resetOnChange);
+		},
 
-		if (!cloverInstance) {
-			initClover();
-		}
+		block: function () {
+			if (this.form && $.fn.block) {
+				this.form.block({
+					message: null,
+					overlayCSS: {
+						background: '#fff',
+						opacity: 0.6,
+					},
+				});
+			}
+		},
 
-		if (!cloverInstance) {
-			return true;
-		}
+		unblock: function () {
+			if (this.form && $.fn.unblock) {
+				this.form.unblock();
+			}
+		},
 
-		if ($form.data('clover-tokenizing')) {
-			e.preventDefault();
-			return false;
-		}
+		onSubmit: function () {
+			if (!this.clover) {
+				this.initCloverElement();
+			}
 
-		$form.data('clover-tokenizing', true);
-		e.preventDefault();
+			if (!this.clover) {
+				cloverGateway.showError(
+					'Payment form could not load. Please refresh the page and try again.'
+				);
+				return;
+			}
 
-		// Let WooCommerce show processing UI if available.
-		if ($.fn.block && typeof wc_checkout_params !== 'undefined') {
-			$form.addClass('processing').block({
-				message: null,
-				overlayCSS: {
-					background: '#fff',
-					opacity: 0.6
-				}
+			this.block();
+
+			this.clover.createToken()
+				.then(function (result) {
+					cloverGateway.chargeTokenSuccess(result);
+				})
+				.catch(function (err) {
+					cloverGateway.chargeTokenFailure(err);
+				});
+		},
+
+		getTokenFromResult: function (result) {
+			if (!result || !result.token) {
+				return '';
+			}
+			if (typeof result.token === 'string') {
+				return result.token;
+			}
+			if (typeof result.token === 'object' && result.token.token) {
+				return result.token.token;
+			}
+			return '';
+		},
+
+		chargeTokenSuccess: function (result) {
+			if (result.errors) {
+				cloverGateway.chargeTokenError(result.errors);
+				return;
+			}
+
+			var token = cloverGateway.getTokenFromResult(result);
+			if (!token) {
+				cloverGateway.unblock();
+				cloverGateway.showError(
+					wc_clover_params.error_token || 'Card information incomplete. Please fill all fields.'
+				);
+				return;
+			}
+
+			var trans = document.getElementById('clover-transresult');
+			var tokenField = document.querySelector('input[name="clover_card_token"]');
+
+			if (tokenField) {
+				tokenField.value = token;
+			}
+			if (trans) {
+				trans.value = '1';
+			}
+
+			cloverGateway.form.submit();
+		},
+
+		chargeTokenFailure: function () {
+			cloverGateway.resetValidationFlag();
+			$('input[name="clover_card_token"]').val('');
+			cloverGateway.unblock();
+			cloverGateway.showError(
+				wc_clover_params.error_generic || 'Payment could not be processed. Please try again.'
+			);
+		},
+
+		chargeTokenError: function (errors) {
+			cloverGateway.resetValidationFlag();
+			$('input[name="clover_card_token"]').val('');
+			cloverGateway.unblock();
+
+			var message = '';
+			if (errors) {
+				Object.keys(errors).forEach(function (key) {
+					if (errors[key] && !message) {
+						message = errors[key];
+					}
+				});
+			}
+
+			if (!message) {
+				message = wc_clover_params.error_invalid || 'Please check your card details and try again.';
+			}
+
+			cloverGateway.showError(message);
+		},
+
+		showError: function (message) {
+			var $form = cloverGateway.form || $('form.checkout');
+			$('.woocommerce-NoticeGroup-checkout').remove();
+			var $notice = $('<div>', {
+				class: 'woocommerce-NoticeGroup woocommerce-NoticeGroup-checkout',
 			});
-		}
+			var $list = $('<ul>', {
+				class: 'woocommerce-error',
+				role: 'alert',
+			});
+			$list.append($('<li>').text(message));
+			$notice.append($list);
+			$form.prepend($notice);
+			$('html, body').animate({ scrollTop: $form.offset().top - 100 }, 300);
+		},
+	};
 
-		ensureTokenAndSubmit($form);
-	});
-
-})(jQuery);
-
+	cloverGateway.init();
+});

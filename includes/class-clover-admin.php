@@ -618,7 +618,11 @@ class Clover_Admin {
 			wp_send_json_error( 'Clover API credentials are not configured.' );
 		}
 
-		$result = $api->fire_order( $clover_order_id, $wc_order_id );
+		// Clear the "already printed" guard and fire immediately (manual retry skips the delay).
+		$wc_order->delete_meta_data( '_clover_print_fired_order' );
+		$wc_order->save();
+
+		$result = $api->send_print_event( $clover_order_id, $wc_order_id );
 
 		if ( $result ) {
 			$wc_order->add_order_note( __( 'Clover print retried successfully.', 'clover-gateway' ) );

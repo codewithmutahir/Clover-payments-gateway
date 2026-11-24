@@ -33,6 +33,13 @@ class Clover_API
 	protected $cached_tax_rates = null;
 
 	/**
+	 * Per-request cache of merchant tenders (populated on first call to get_merchant_tenders()).
+	 *
+	 * @var array|null
+	 */
+	protected $cached_tenders = null;
+
+	/**
 	 * Log to both WooCommerce logger (visible in WC > Status > Logs > clover-gateway)
 	 * and PHP error_log when WP_DEBUG_LOG is enabled.
 	 *
@@ -191,10 +198,53 @@ class Clover_API
 
 		if ($code < 200 || $code >= 300) {
 			$this->log('eCommerce API HTTP ' . $code . ': ' . wp_json_encode($body), 'error');
-			return array('success' => false, 'message' => __('Payment could not be processed. Please try again.', 'clover-gateway'), 'data' => $body);
+			return array(
+				'success'   => false,
+				'message'   => $this->ecomm_error_message($body, $code),
+				'http_code' => (int) $code,
+				'data'      => $body,
+			);
 		}
 
 		return array('success' => true, 'data' => $body);
+	}
+
+	/**
+	 * Human-readable message from a Clover eCommerce API error body.
+	 *
+	 * @param array|null $body      Decoded JSON body.
+	 * @param int        $http_code HTTP status.
+	 * @return string
+	 */
+	protected function ecomm_error_message($body, $http_code = 0)
+	{
+		$fallback = __('Payment could not be processed. Please try again.', 'clover-gateway');
+
+		if (! is_array($body)) {
+			return $fallback;
+		}
+
+		if (! empty($body['error']['message'])) {
+			return (string) $body['error']['message'];
+		}
+
+		if (! empty($body['message'])) {
+			return (string) $body['message'];
+		}
+
+		if (! empty($body['error']['decline_code'])) {
+			return sprintf(
+				/* translators: %s: card decline code */
+				__('Your card was declined (%s). Please try another card.', 'clover-gateway'),
+				(string) $body['error']['decline_code']
+			);
+		}
+
+		if (401 === (int) $http_code) {
+			return __('Clover payment credentials are invalid. Please contact the store.', 'clover-gateway');
+		}
+
+		return $fallback;
 	}
 
 	/**
@@ -230,6 +280,39 @@ class Clover_API
 	}
 
 	/**
+	 * Discard the stored idempotency key for an order.
+	 *
+	 * Clover replays the original response for a repeated key, so a retry after a
+	 * decline must use a fresh key or the customer's second card is never charged.
+	 *
+	 * @param int $order_id WooCommerce order ID.
+	 */
+	protected function clear_idempotency_key($order_id)
+	{
+		delete_transient('clover_idem_' . (int) $order_id);
+	}
+
+	/**
+	 * Whether a failed payment attempt is safe to retry with a new idempotency key.
+	 *
+	 * Ambiguous failures are excluded: the card may have been charged, and a fresh
+	 * key would let a retry charge it again.
+	 *
+	 * @param array $result Failed payment result.
+	 * @return bool
+	 */
+	protected function is_retryable_payment_failure($result)
+	{
+		if (! empty($result['declined'])) {
+			return true;
+		}
+
+		$code = isset($result['http_code']) ? (int) $result['http_code'] : 0;
+
+		return $code >= 400 && $code < 500 && ! in_array($code, array(408, 429), true);
+	}
+
+	/**
 	 * Add a single line item to a Clover order.
 	 *
 	 * @param string      $clover_order_id  Clover order ID.
@@ -238,13 +321,12 @@ class Clover_API
 	 * @param bool        $apply_tax        When true, embeds the configured default tax rate into the
 	 *                                      line item creation payload so Clover records it in the Tax Report.
 	 *                                      Pass false for shipping/fees to avoid taxing non-product lines.
-	 * @param int         $unit_qty         Quantity in Clover milli-units (qty 4 => 4000).
+	 * @param int         $quantity         WooCommerce quantity.
 	 *
 	 * @return array{success:bool,id?:string,message?:string}
 	 */
-	protected function add_line_item( $clover_order_id, $name, $price_cents, $apply_tax = false, $unit_qty = 1000 ) {
-		$unit_qty = max( 1000, (int) $unit_qty );
-		$quantity = (int) $unit_qty / 1000;
+	protected function add_line_item( $clover_order_id, $name, $price_cents, $apply_tax = false, $quantity = 1 ) {
+		$quantity = max( 1, (int) $quantity );
 
 		$this->log(
 			'Sequential add_line_item: ' . $name
@@ -266,7 +348,7 @@ class Clover_API
 			$body = $this->build_line_item_request_body(
 				$name,
 				(int) $price_cents,
-				$unit_qty,
+				$quantity,
 				$attempt['apply_tax']
 			);
 
@@ -299,24 +381,106 @@ class Clover_API
 	}
 
 	/**
+	 * Add a pre-built ad-hoc line item payload (used by sequential sync).
+	 *
+	 * @param string               $clover_order_id Clover order ID.
+	 * @param array<string,mixed>  $li              Sanitized line item body.
+	 * @return array{success:bool,id?:string,message?:string}
+	 */
+	protected function add_line_item_from_payload( $clover_order_id, array $li ) {
+		$clean = $this->sanitize_line_items_for_api( array( $li ) );
+		$body  = isset( $clean[0] ) ? $clean[0] : array();
+
+		if ( empty( $body['name'] ) ) {
+			return array(
+				'success' => false,
+				'message' => __( 'Line item name is required.', 'clover-gateway' ),
+			);
+		}
+
+		$this->log(
+			'Sequential add_line_item payload: ' . wp_json_encode( $body )
+		);
+
+		$result = $this->request_v3(
+			'POST',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/orders/' . rawurlencode( $clover_order_id ) . '/line_items',
+			$body
+		);
+
+		if ( ! empty( $result['success'] ) && ! empty( $result['data']['id'] ) ) {
+			return array(
+				'success' => true,
+				'id'      => (string) $result['data']['id'],
+			);
+		}
+
+		return array(
+			'success' => false,
+			'message' => $this->api_error_message( $result ),
+		);
+	}
+
+	/**
+	 * Log if Clover attached catalog inventory or unitQty after sync (causes 1/1 prints).
+	 *
+	 * @param string   $clover_order_id Clover order ID.
+	 * @param WC_Order $order           WooCommerce order.
+	 * @return void
+	 */
+	protected function audit_clover_line_items_after_sync( $clover_order_id, $order ) {
+		$fetch = $this->fetch_order_with_line_items( $clover_order_id );
+		if ( empty( $fetch['success'] ) || empty( $fetch['order']['lineItems']['elements'] ) ) {
+			return;
+		}
+
+		foreach ( $fetch['order']['lineItems']['elements'] as $li ) {
+			$name = isset( $li['name'] ) ? (string) $li['name'] : '';
+			$issues = array();
+
+			if ( ! empty( $li['item']['id'] ) ) {
+				$issues[] = 'catalog-linked id=' . $li['item']['id'];
+			}
+			if ( isset( $li['unitQty'] ) && (int) $li['unitQty'] > 0 ) {
+				$issues[] = 'unitQty=' . (int) $li['unitQty'];
+			}
+
+			if ( ! empty( $issues ) ) {
+				$this->log(
+					'POST-SYNC AUDIT [' . $name . ']: ' . implode( ', ', $issues )
+					. ' — this causes 1/1 kitchen display',
+					'error'
+				);
+				$order->add_order_note(
+					sprintf(
+						/* translators: 1: item name, 2: issue details */
+						__( 'Clover line "%1$s" has %2$s — kitchen may show 1/1. Check Clover catalog name match or Group Line Items setting.', 'clover-gateway' ),
+						$name,
+						implode( ', ', $issues )
+					)
+				);
+			}
+		}
+
+		$order->save();
+	}
+
+	/**
 	 * Build the POST body for a single Clover order line item.
 	 *
 	 * @param string      $name         Line item name.
 	 * @param int         $price_cents  Unit price in cents.
-	 * @param int         $unit_qty     Quantity in Clover milli-units.
+	 * @param int         $quantity     WooCommerce quantity (unitQty omitted when 1).
 	 * @param bool        $apply_tax    Whether to embed default tax metadata.
 	 * @return array<string,mixed>
 	 */
-	protected function build_line_item_request_body( $name, $price_cents, $unit_qty, $apply_tax = false ) {
-		$quantity_sold = (float) ( (int) $unit_qty / 1000 );
+	protected function build_line_item_request_body( $name, $price_cents, $quantity, $apply_tax = false ) {
+		$quantity = max( 1, (int) $quantity );
 
+		// Never send unitQty — kitchen printers render it as a "N/N" quantity prefix.
 		$body = array(
-			'name'         => $name,
-			'price'        => (int) $price_cents,
-			'unitQty'      => (int) $unit_qty,
-			'quantitySold' => $quantity_sold,
-			'printed'      => false,
-			'exchanged'    => false,
+			'name'  => $name,
+			'price' => (int) $price_cents,
 		);
 
 		if ($apply_tax && ! empty($this->default_tax_rate_id)) {
@@ -326,8 +490,8 @@ class Clover_API
 				$rate_val = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
 
 				if ($rate_val > 0) {
-					$line_total_cents  = (int) round($price_cents * $unit_qty / 1000);
-					$body['taxAmount'] = (int) round($line_total_cents * $rate_val / 1000000000);
+					$line_total_cents  = (int) $price_cents * $quantity;
+					$body['taxAmount'] = (int) round( $line_total_cents * $rate_val / 1000000000 );
 				}
 
 				$body['taxRates'] = array(
@@ -419,14 +583,120 @@ class Clover_API
 	}
 
 	/**
-	 * Clover line-item quantity in milli-units (qty 1 => 1000).
+	 * Strip characters that thermal / ESC-POS printers render as garbage.
 	 *
-	 * @param int $quantity Human-readable quantity.
-	 * @return int
+	 * Zero-width Unicode (ZWNJ, ZWSP, BOM, soft hyphen, word joiner) and most
+	 * C0/C1 controls print as random glyphs like "| 6s8" on Clover kitchen tickets.
+	 * Newlines and tabs are kept for order notes.
+	 *
+	 * @param string $text Raw text.
+	 * @return string Printer-safe text.
 	 */
-	protected function clover_unit_qty($quantity)
-	{
-		return max(1000, (int) $quantity * 1000);
+	protected function sanitize_printer_text( $text ) {
+		$text = (string) $text;
+
+		if ( '' === $text ) {
+			return $text;
+		}
+
+		// Zero-width / invisible Unicode that printers cannot render.
+		$text = preg_replace( '/[\x{200B}-\x{200D}\x{2060}\x{FEFF}\x{00AD}]/u', '', $text );
+
+		// Control chars except TAB / LF / CR.
+		$text = preg_replace( '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $text );
+
+		return is_string( $text ) ? $text : '';
+	}
+
+	/**
+	 * Build a kitchen-safe ad-hoc line item name.
+	 *
+	 * Names must be plain printable text — do not inject zero-width or other
+	 * "invisible" Unicode to break Clover catalog matching; thermal printers
+	 * render those bytes as garbage (e.g. "C| 6s8hicken" instead of "Chicken").
+	 * Catalog 1/1 / x1/1 is already avoided by sending ad-hoc lines (no item.id)
+	 * and never sending unitQty (one API line per unit).
+	 *
+	 * @param string $name     WooCommerce product name.
+	 * @param int    $quantity Line quantity.
+	 * @return string
+	 */
+	protected function clover_kitchen_line_name( $name, $quantity ) {
+		$name = $this->sanitize_printer_text( (string) $name );
+		$collapsed = preg_replace( '/\s+/u', ' ', $name );
+		$name      = trim( is_string( $collapsed ) ? $collapsed : $name );
+
+		/**
+		 * Filter the Clover kitchen / receipt line item name.
+		 *
+		 * Return only printable text — zero-width Unicode will garble thermal prints.
+		 *
+		 * @param string $name     Sanitized product name.
+		 * @param int    $quantity Line quantity (always 1 for per-unit expansion).
+		 */
+		$filtered = (string) apply_filters( 'clover_gateway_kitchen_line_name', $name, $quantity );
+
+		// Re-sanitize so a filter cannot reintroduce unprintable Unicode onto tickets.
+		return trim( $this->sanitize_printer_text( $filtered ) );
+	}
+
+	/**
+	 * Build ad-hoc Clover line items for one WooCommerce product row.
+	 *
+	 * Kitchen printers render unitQty as a "N/N" prefix (e.g. 1/1, 2/2). The only
+	 * reliable fix is one API line item per unit: name + unit price, never unitQty.
+	 * Clover's "Group line items" setting (Setup → Order Receipts) merges duplicates
+	 * into a single "2 Item Name" row on the ticket.
+	 *
+	 * @param WC_Order_Item_Product $item             Order line item.
+	 * @param int                   $quantity         Quantity.
+	 * @param int                   $unit_price_cents Per-unit price in cents.
+	 * @param int                   $line_total_cents Full line total in cents.
+	 * @return array<int,array<string,mixed>>
+	 */
+	protected function build_adhoc_product_line_items( $item, $quantity, $unit_price_cents, $line_total_cents ) {
+		$quantity = max( 1, (int) $quantity );
+		$lines    = array();
+		$name     = $this->clover_kitchen_line_name( $item->get_name(), 1 );
+
+		$line_tax_cents = 0;
+		$tax_rates      = array();
+
+		if ( ! empty( $this->default_tax_rate_id ) ) {
+			$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
+
+			if ( $full_rate && ! empty( $full_rate['rate'] ) && (int) $full_rate['rate'] > 0 ) {
+				$line_tax_cents = (int) round( $line_total_cents * (int) $full_rate['rate'] / 1000000000 );
+				$tax_rates      = array(
+					array(
+						'id'        => $this->default_tax_rate_id,
+						'name'      => isset( $full_rate['name'] ) ? (string) $full_rate['name'] : '',
+						'rate'      => (int) $full_rate['rate'],
+						'isDefault' => true,
+					),
+				);
+			}
+		}
+
+		$unit_tax_cents = $quantity > 0 ? (int) floor( $line_tax_cents / $quantity ) : 0;
+		$tax_remainder  = $line_tax_cents - ( $unit_tax_cents * $quantity );
+
+		for ( $u = 0; $u < $quantity; $u++ ) {
+			$li = array(
+				'name'  => $name,
+				'price' => (int) $unit_price_cents,
+			);
+
+			if ( ! empty( $tax_rates ) && $line_tax_cents > 0 ) {
+				$this_unit_tax   = $unit_tax_cents + ( $u < $tax_remainder ? 1 : 0 );
+				$li['taxAmount'] = $this_unit_tax;
+				$li['taxRates']  = $tax_rates;
+			}
+
+			$lines[] = $li;
+		}
+
+		return $lines;
 	}
 
 	/**
@@ -485,7 +755,7 @@ class Clover_API
 
 		$link = (bool) apply_filters(
 			'clover_gateway_link_inventory_items',
-			true,
+			false,
 			$order,
 			$item
 		);
@@ -650,64 +920,20 @@ class Clover_API
 				continue;
 			}
 
-			$unit_price_cents = (int) round(($total / $quantity) * 100);
+			$line_total_cents = (int) round( $total * 100 );
+			$unit_price_cents = (int) round( ( $total / $quantity ) * 100 );
+			$product_lines    = $this->build_adhoc_product_line_items( $item, $quantity, $unit_price_cents, $line_total_cents );
 
-			$clover_item_id = null;
-			$linked         = false;
-
-			if ( ! $force_adhoc ) {
-				$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
-				$linked         = null !== $clover_item_id;
-			}
-
-			$li = array(
-				'name'         => $item->get_name(),
-				'price'        => $unit_price_cents,
-				'unitQty'      => $this->clover_unit_qty( $quantity ),
-				'quantitySold' => (float) $quantity,
-				'printed'      => false,
-				'exchanged'    => false,
+			$this->log(
+				'Item [' . $item->get_name() . ']: ' . count( $product_lines ) . ' ad-hoc unit line(s)'
+				. ' wc_qty=' . $quantity
+				. ' unit_price_cents=' . $unit_price_cents
+				. ' (no unitQty — prevents 1/1 print prefix)'
 			);
 
-			if ( $linked ) {
-				$li['item'] = array( 'id' => $clover_item_id );
+			foreach ( $product_lines as $product_line ) {
+				$elements[] = $product_line;
 			}
-
-			if ( $force_adhoc ) {
-				$this->log(
-					'Item [' . $item->get_name() . ']: FORCED ad-hoc unitQty='
-					. $this->clover_unit_qty( $quantity )
-					. ' qty=' . $quantity
-				);
-			} elseif ( $linked ) {
-				$this->log(
-					'Item [' . $item->get_name() . ']: inventory-linked id=' . $clover_item_id . ' qty=' . $quantity
-				);
-			} else {
-				$this->log(
-					'Item [' . $item->get_name() . ']: ad-hoc unitQty=' . $this->clover_unit_qty( $quantity ) . ' qty=' . $quantity
-				);
-			}
-
-			if ( ! empty( $this->default_tax_rate_id ) ) {
-				$full_rate = $this->get_tax_rate_by_id( $this->default_tax_rate_id );
-
-				if ( $full_rate && ! empty( $full_rate['rate'] ) && (int) $full_rate['rate'] > 0 ) {
-					$line_total_cents = $unit_price_cents * $quantity;
-					$li['taxAmount']  = (int) round( $line_total_cents * (int) $full_rate['rate'] / 1000000000 );
-
-					$li['taxRates'] = array(
-						array(
-							'id'        => $this->default_tax_rate_id,
-							'name'      => isset( $full_rate['name'] ) ? (string) $full_rate['name'] : '',
-							'rate'      => (int) $full_rate['rate'],
-							'isDefault' => true,
-						),
-					);
-				}
-			}
-
-			$elements[] = $li;
 		}
 
 		$shipping_total = (float) $order->get_shipping_total();
@@ -719,10 +945,8 @@ class Clover_API
 			}
 
 			$elements[] = array(
-				'name'    => $shipping_label,
-				'price'   => (int) round($shipping_total * 100),
-				'unitQty' => 1000,
-				'printed' => false,
+				'name'  => $shipping_label,
+				'price' => (int) round($shipping_total * 100),
 			);
 		}
 
@@ -735,10 +959,8 @@ class Clover_API
 			}
 
 			$elements[] = array(
-				'name'    => $fee_name,
-				'price'   => (int) round($fee_total * 100),
-				'unitQty' => 1000,
-				'printed' => false,
+				'name'  => $fee_name,
+				'price' => (int) round($fee_total * 100),
 			);
 		}
 
@@ -749,10 +971,8 @@ class Clover_API
 			$tax_total = (float) $order->get_total_tax();
 			if ( $tax_total > 0 ) {
 				$elements[] = array(
-					'name'    => __( 'Tax', 'clover-gateway' ),
-					'price'   => (int) round( $tax_total * 100 ),
-					'unitQty' => 1000,
-					'printed' => false,
+					'name'  => __( 'Tax', 'clover-gateway' ),
+					'price' => (int) round( $tax_total * 100 ),
 				);
 			}
 		}
@@ -760,10 +980,8 @@ class Clover_API
 		$discount_total = (float) $order->get_discount_total();
 		if ($discount_total > 0) {
 			$elements[] = array(
-				'name'    => __('Discount', 'clover-gateway'),
-				'price'   => -1 * abs((int) round($discount_total * 100)),
-				'unitQty' => 1000,
-				'printed' => false,
+				'name'  => __('Discount', 'clover-gateway'),
+				'price' => -1 * abs((int) round($discount_total * 100)),
 			);
 		}
 
@@ -780,118 +998,10 @@ class Clover_API
 	 */
 	protected function build_line_items_from_order($order)
 	{
-		$elements = array();
-
-		foreach ($order->get_items() as $item) {
-			$quantity = (int) $item->get_quantity();
-			$total    = (float) $item->get_total();
-
-			if ($quantity <= 0) {
-				continue;
-			}
-
-			$unit_price_cents = (int) round(($total / $quantity) * 100);
-
-			$clover_item_id = $this->resolve_clover_item_id_for_line_item( $order, $item );
-
-			if ( ! empty( $clover_item_id ) && ! empty( $this->default_tax_rate_id ) ) {
-				$cache_key = 'clover_itax_' . md5($clover_item_id . '_' . $this->default_tax_rate_id);
-				if (! get_transient($cache_key)) {
-					$assigned = $this->assign_item_tax_rate($clover_item_id, $this->default_tax_rate_id);
-					set_transient(
-						$cache_key,
-						$assigned ? 'ok' : 'attempted',
-						$assigned ? 7 * DAY_IN_SECONDS : HOUR_IN_SECONDS
-					);
-				}
-			}
-
-			$linked = null !== $clover_item_id;
-
-			$li = array(
-				'name'         => $item->get_name(),
-				'price'        => $unit_price_cents,
-				'unitQty'      => $this->clover_unit_qty( $quantity ),
-				'quantitySold' => (float) $quantity,
-				'printed'      => false,
-				'exchanged'    => false,
-			);
-
-			if ( $linked ) {
-				$li['item'] = array( 'id' => $clover_item_id );
-			}
-
-			$this->log(
-				'[sequential] Line item: ' . $item->get_name()
-				. ' | qty=' . $quantity
-				. ' | unitQty=' . $this->clover_unit_qty( $quantity )
-				. ' | quantitySold=' . (float) $quantity
-				. ' | price_cents=' . $unit_price_cents
-				. ( $linked ? ' | linked=' . $clover_item_id : ' | ad-hoc' )
-			);
-
-			if (! empty($this->default_tax_rate_id)) {
-				$full_rate = $this->get_tax_rate_by_id($this->default_tax_rate_id);
-
-				if ($full_rate) {
-					$rate_val = isset($full_rate['rate']) ? (int) $full_rate['rate'] : 0;
-
-					if ($rate_val > 0) {
-						$li['taxAmount'] = (int) round($unit_price_cents * $quantity * $rate_val / 1000000000);
-					}
-
-					$li['taxRates'] = array(
-						array(
-							'id'        => $this->default_tax_rate_id,
-							'name'      => isset( $full_rate['name'] ) ? (string) $full_rate['name'] : '',
-							'rate'      => $rate_val,
-							'isDefault' => true,
-						),
-					);
-				}
-			}
-
-			$li['apply_tax']      = true;
-			$li['clover_item_id'] = $clover_item_id;
-			$elements[]           = $li;
-		}
-
-		$shipping_total = (float) $order->get_shipping_total();
-		if ($shipping_total > 0) {
-			$shipping_label  = __('Shipping', 'clover-gateway');
-			$shipping_method = $order->get_shipping_method();
-			if ($shipping_method) {
-				$shipping_label = sprintf(__('Shipping: %s', 'clover-gateway'), $shipping_method);
-			}
-
-			$elements[] = array(
-				'name'      => $shipping_label,
-				'price'     => (int) round($shipping_total * 100),
-				'unitQty'   => 1000,
-				'printed'   => false,
-				'apply_tax' => false,
-			);
-		}
-
-		foreach ($order->get_fees() as $fee) {
-			$fee_total = (float) $fee->get_total();
-			$fee_name  = $fee->get_name();
-
-			if (abs($fee_total) <= 0 || stripos($fee_name, 'tax') !== false) {
-				continue;
-			}
-
-			$elements[] = array(
-				'name'      => $fee_name,
-				'price'     => (int) round($fee_total * 100),
-				'unitQty'   => 1000,
-				'printed'   => false,
-				'apply_tax' => false,
-			);
-		}
+		$data = $this->build_atomic_line_items( $order, true );
 
 		return array(
-			'elements' => $elements,
+			'elements' => isset( $data['elements'] ) ? $data['elements'] : array(),
 		);
 	}
 
@@ -906,7 +1016,23 @@ class Clover_API
 		$clean = array();
 
 		foreach ($line_items as $li) {
-			unset($li['apply_tax'], $li['clover_item_id']);
+			unset(
+				$li['apply_tax'],
+				$li['clover_item_id'],
+				$li['item'],
+				$li['unitQty'],
+				$li['quantitySold'],
+				$li['printed'],
+				$li['exchanged'],
+				$li['itemCode'],
+				$li['alternateName']
+			);
+
+			// Ensure names stay printer-safe on every sync path (atomic + sequential).
+			if ( isset( $li['name'] ) ) {
+				$li['name'] = trim( $this->sanitize_printer_text( (string) $li['name'] ) );
+			}
+
 			$clean[] = $li;
 		}
 
@@ -946,6 +1072,10 @@ class Clover_API
 	/**
 	 * Build the order note from WooCommerce order data.
 	 *
+	 * Sent as Clover order `note` (shows on POS and kitchen ORDER tickets).
+	 * Includes customer/order notes from WooCommerce and common theme meta
+	 * (e.g. KR theme `_kr_order_notes`, `_kr_fulfillment_type`).
+	 *
 	 * @param WC_Order $order WooCommerce order.
 	 * @return string
 	 */
@@ -953,6 +1083,11 @@ class Clover_API
 	{
 		$note_lines   = array();
 		$note_lines[] = 'Order #' . $order->get_order_number();
+
+		$payment_title = trim( (string) $order->get_payment_method_title() );
+		if ( $payment_title ) {
+			$note_lines[] = 'Payment: ' . $payment_title;
+		}
 
 		$billing_name = trim($order->get_formatted_billing_full_name());
 		if ($billing_name) {
@@ -962,28 +1097,69 @@ class Clover_API
 			$note_lines[] = 'Phone: ' . $order->get_billing_phone();
 		}
 
+		// Legacy meta keys (other themes / older integrations).
 		$order_type    = $order->get_meta('_order_type', true);
 		$delivery_date = $order->get_meta('_delivery_date', true);
 		$delivery_time = $order->get_meta('_delivery_time', true);
 		$pickup_time   = $order->get_meta('_pickup_time', true);
 
-		if ($order_type && ($delivery_date || $delivery_time || $pickup_time)) {
-			$label = ($order_type === 'pickup') ? __('Pickup', 'clover-gateway') : __('Delivery', 'clover-gateway');
+		// KR theme (and similar) fulfillment meta.
+		$kr_type = $order->get_meta('_kr_fulfillment_type', true);
+		$kr_dt   = $order->get_meta('_kr_preferred_datetime', true);
+
+		if (! $order_type && $kr_type) {
+			$order_type = $kr_type;
+		}
+
+		if ($order_type && ($delivery_date || $delivery_time || $pickup_time || $kr_dt)) {
+			$label = ( 'pickup' === $order_type ) ? __('Pickup', 'clover-gateway') : __('Delivery', 'clover-gateway');
 			$parts = array();
 			if ($delivery_date) {
 				$parts[] = $delivery_date;
 			}
-			if ($order_type === 'pickup' && $pickup_time) {
+			if ( 'pickup' === $order_type && $pickup_time ) {
 				$parts[] = $pickup_time;
-			} elseif ($order_type === 'delivery' && $delivery_time) {
+			} elseif ( 'delivery' === $order_type && $delivery_time ) {
 				$parts[] = $delivery_time;
+			}
+			if ( empty( $parts ) && $kr_dt ) {
+				$parts[] = $kr_dt;
 			}
 			if (! empty($parts)) {
 				$note_lines[] = $label . ': ' . implode(' ', $parts);
 			}
+		} elseif ( $kr_dt ) {
+			$note_lines[] = __( 'Preferred time', 'clover-gateway' ) . ': ' . $kr_dt;
 		}
 
-		return implode("\n", $note_lines);
+		// WooCommerce customer note (checkout "Order notes" / theme-populated note).
+		$customer_note = trim( (string) $order->get_customer_note() );
+
+		// Theme-specific order notes meta (KR: _kr_order_notes).
+		$theme_notes = trim( (string) $order->get_meta( '_kr_order_notes', true ) );
+
+		$extra_notes = array();
+		if ( $customer_note ) {
+			$extra_notes[] = $customer_note;
+		}
+		if ( $theme_notes && false === stripos( $customer_note, $theme_notes ) ) {
+			$extra_notes[] = 'Order notes: ' . $theme_notes;
+		}
+
+		if ( ! empty( $extra_notes ) ) {
+			$note_lines[] = implode( "\n", $extra_notes );
+		}
+
+		/**
+		 * Filter the Clover order note text before it is sent to POS / kitchen print.
+		 *
+		 * @param string   $note  Assembled note.
+		 * @param WC_Order $order WooCommerce order.
+		 */
+		$note = implode( "\n", $note_lines );
+		$note = (string) apply_filters( 'clover_gateway_order_note', $note, $order );
+
+		return $this->sanitize_printer_text( $note );
 	}
 
 	/**
@@ -1119,7 +1295,7 @@ class Clover_API
 	 * @param string $clover_order_id Clover order ID.
 	 * @return bool
 	 */
-	protected function delete_clover_order($clover_order_id)
+	public function delete_clover_order($clover_order_id)
 	{
 		if (empty($clover_order_id)) {
 			return false;
@@ -1201,79 +1377,20 @@ class Clover_API
 	}
 
 	/**
-	 * Create Clover order via atomic_order API (preferred — single call with all line items).
+	 * Create Clover order via custom order + line_items API (primary path).
 	 *
-	 * @param WC_Order $order WooCommerce order.
-	 * @return array|false Result array on success, false on failure.
-	 */
-	protected function create_atomic_order($order)
-	{
-		$line_data  = $this->build_atomic_line_items($order);
-		$line_items = $line_data['elements'];
-
-		if (empty($line_items)) {
-			$this->log('No line items to sync for WC order #' . $order->get_order_number(), 'error');
-			return array(
-				'failure' => 'deterministic',
-				'message' => __('No line items could be mapped for Clover.', 'clover-gateway'),
-			);
-		}
-
-		$tax_cents   = $this->calculate_order_tax_cents( $order );
-		$total_cents = (int) round((float) $order->get_total() * 100);
-
-		$payload = array(
-			'state'      => 'open',
-			'title'      => $this->get_order_title($order),
-			'note'       => $this->build_order_note($order),
-			'currency'   => strtoupper($order->get_currency() ?: 'USD'),
-			'total'      => $total_cents,
-			'taxAmount'  => $tax_cents,
-			'lineItems'  => $line_data,
-			'testMode'   => (bool) $this->test_mode,
-		);
-
-		$result = $this->request_v3(
-			'POST',
-			'/merchants/' . rawurlencode($this->merchant_id) . '/atomic_order/orders',
-			$payload
-		);
-
-		if (
-			empty( $result['success'] )
-			&& $this->should_fallback_atomic_to_adhoc( $result, $line_items )
-		) {
-			$this->log(
-				'Atomic order failed due to invalid inventory links for WC order #'
-				. $order->get_order_number()
-				. ' — retrying all line items as ad-hoc',
-				'warning'
-			);
-
-			$line_data            = $this->build_atomic_line_items( $order, true );
-			$payload['lineItems'] = $line_data;
-
-			$result = $this->request_v3(
-				'POST',
-				'/merchants/' . rawurlencode( $this->merchant_id ) . '/atomic_order/orders',
-				$payload
-			);
-		}
-
-		return $this->parse_order_create_api_result($order, $result, $tax_cents, $total_cents, count($line_items));
-	}
-
-	/**
-	 * Fallback: create Clover order shell then add line items sequentially.
+	 * Avoids atomic_order, which can attach catalog inventory by product name and
+	 * cause kitchen/POS to show x1/1 fire-fraction display instead of plain quantity.
 	 *
 	 * @param WC_Order $order WooCommerce order.
 	 * @return array|false Result array on success, false on failure.
 	 */
 	protected function create_order_sequential($order)
 	{
-		// Sequential fallback must never link inventory — ad-hoc line items only.
+		// Custom order + line_items API only — avoids atomic_order catalog matching.
 		$line_data  = $this->build_atomic_line_items( $order, true );
-		$line_items = $line_data['elements'];
+		$line_items = $this->sanitize_line_items_for_api( $line_data['elements'] );
+		$line_data  = array( 'elements' => $line_items );
 
 		if (empty($line_items)) {
 			return array(
@@ -1308,22 +1425,13 @@ class Clover_API
 		$line_item_total = count($line_items);
 
 		foreach ( $line_items as $index => $li ) {
-			$name    = isset( $li['name'] )         ? $li['name']         : '';
-			$price   = isset( $li['price'] )        ? (int) $li['price']  : 0;
-			$qty     = isset( $li['unitQty'] )      ? (int) $li['unitQty']: 1000;
-			$quantity = isset( $li['quantitySold'] ) ? (float) $li['quantitySold'] : ( (int) $qty / 1000 );
-			// Apply tax only for product line items (those that have taxRates set).
-			// Shipping and fee items in the array do not have taxRates.
+			$name  = isset( $li['name'] ) ? $li['name'] : '';
+			$price = isset( $li['price'] ) ? (int) $li['price'] : 0;
 			$apply_tax_for_item = ! empty( $li['taxRates'] );
 
-			$this->log(
-				'Sequential line item: ' . $name
-				. ' qty=' . $quantity
-				. ' unitQty=' . (int) $qty
-				. ' quantitySold=' . (float) $quantity
-			);
+			$this->log( 'Sequential line item #' . ( $index + 1 ) . ': ' . $name . ' price_cents=' . $price );
 
-			$added = $this->add_line_item( $clover_order_id, $name, $price, $apply_tax_for_item, $qty );
+			$added = $this->add_line_item_from_payload( $clover_order_id, $li );
 
 			if (empty($added['success']) || empty($added['id'])) {
 				$api_message = ! empty($added['message']) ? (string) $added['message'] : '';
@@ -1393,6 +1501,55 @@ class Clover_API
 	}
 
 	/**
+	 * Fallback: create Clover order via atomic_order API (single request).
+	 *
+	 * @param WC_Order $order WooCommerce order.
+	 * @return array|false Result array on success, false on failure.
+	 */
+	protected function create_atomic_order($order)
+	{
+		$line_data  = $this->build_atomic_line_items( $order, true );
+		$line_items = $this->sanitize_line_items_for_api( $line_data['elements'] );
+		$line_data  = array( 'elements' => $line_items );
+
+		if ( empty( $line_items ) ) {
+			return array(
+				'failure' => 'deterministic',
+				'message' => __( 'No line items could be mapped for Clover.', 'clover-gateway' ),
+			);
+		}
+
+		$tax_cents   = $this->calculate_order_tax_cents( $order );
+		$total_cents = (int) round( (float) $order->get_total() * 100 );
+
+		$payload = array(
+			'state'     => 'open',
+			'title'     => $this->get_order_title( $order ),
+			'note'      => $this->build_order_note( $order ),
+			'currency'  => strtoupper( $order->get_currency() ?: 'USD' ),
+			'total'     => $total_cents,
+			'taxAmount' => $tax_cents,
+			'lineItems' => $line_data,
+			'testMode'  => (bool) $this->test_mode,
+		);
+
+		$this->log( 'Atomic fallback payload: ' . wp_json_encode( $line_data ) );
+
+		$result = $this->request_v3(
+			'POST',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/atomic_order/orders',
+			$payload
+		);
+
+		$parsed = $this->parse_order_create_api_result( $order, $result, $tax_cents, $total_cents, count( $line_items ) );
+		if ( is_array( $parsed ) && ! $this->is_order_creation_failure( $parsed ) ) {
+			$parsed['used_sequential'] = false;
+		}
+
+		return $parsed;
+	}
+
+	/**
 	 * Explicitly set the total on a Clover order after line items are added.
 	 *
 	 * @param string $clover_order_id Clover order ID.
@@ -1437,26 +1594,27 @@ class Clover_API
 	{
 		$this->ensure_order_totals($order);
 
-		$created        = $this->create_atomic_order($order);
-		$atomic_failure = null;
+		// Prefer custom order + line_items — atomic_order can attach catalog inventory by name.
+		$created           = $this->create_order_sequential($order);
+		$sequential_failure = null;
 
 		if ($this->is_order_creation_failure($created)) {
-			$atomic_failure = $created;
+			$sequential_failure = $created;
 			$this->log(
-				'Atomic order creation failed for WC order #' . $order->get_order_number()
-					. ' — falling back to sequential. '
+				'Sequential order creation failed for WC order #' . $order->get_order_number()
+					. ' — falling back to atomic. '
 					. (isset($created['message']) ? $created['message'] : ''),
 				'warning'
 			);
-			$created = $this->create_order_sequential($order);
+			$created = $this->create_atomic_order($order);
 		}
 
 		if ($this->is_order_creation_failure($created)) {
 			$message = '';
 			if (! empty($created['message'])) {
 				$message = (string) $created['message'];
-			} elseif ($atomic_failure && ! empty($atomic_failure['message'])) {
-				$message = (string) $atomic_failure['message'];
+			} elseif ($sequential_failure && ! empty($sequential_failure['message'])) {
+				$message = (string) $sequential_failure['message'];
 			}
 			if ('' === $message) {
 				$message = __('Order could not be created in Clover.', 'clover-gateway');
@@ -1478,12 +1636,15 @@ class Clover_API
 
 		if ( function_exists( 'clover_gateway_is_order_debug_enabled' ) && clover_gateway_is_order_debug_enabled() ) {
 			$force_adhoc = ! empty( $created['used_sequential'] );
-			$snapshot    = $this->build_atomic_line_items( $order, $force_adhoc );
+			$snapshot    = $this->build_atomic_line_items( $order, true );
 			$order->update_meta_data( '_clover_debug_sent_payload', $snapshot['elements'] );
 			$order->update_meta_data( '_clover_debug_sync_path', $force_adhoc ? 'sequential' : 'atomic' );
+			$order->update_meta_data( '_clover_line_format', 'unit-expand-v1.0.7' );
 			$order->update_meta_data( '_clover_debug_saved_at', current_time( 'mysql' ) );
 			$order->save();
 		}
+
+		$this->audit_clover_line_items_after_sync( $created['clover_order_id'], $order );
 
 		return array(
 			'success'         => true,
@@ -1524,10 +1685,419 @@ class Clover_API
 	}
 
 	/**
-	 * Charge a tokenized card against a Clover order.
+	 * Resolve the customer's IP for Clover fraud signals.
 	 *
-	 * Returns a rich result array including card brand, last4, and the Clover v3 payment ID
-	 * so callers can persist these for display in WooCommerce and in the Clover Orders dashboard.
+	 * Clover requires X-Forwarded-For on the pay-for-order endpoint, so this never
+	 * returns an empty string.
+	 *
+	 * @return string
+	 */
+	protected function get_client_ip()
+	{
+		$ip = class_exists('WC_Geolocation')
+			? WC_Geolocation::get_ip_address()
+			: sanitize_text_field(wp_unslash(isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : ''));
+
+		return $ip ? $ip : '0.0.0.0';
+	}
+
+	/**
+	 * Build the settlement reference sent to the merchant's gateway.
+	 *
+	 * Clover caps this at 12 alphanumeric characters (spaces allowed).
+	 *
+	 * @param WC_Order $order WooCommerce order.
+	 * @return string
+	 */
+	protected function build_external_reference_id($order)
+	{
+		$reference = preg_replace('/[^A-Za-z0-9 ]/', '', (string) $order->get_id());
+
+		return substr((string) $reference, 0, 12);
+	}
+
+	/**
+	 * Normalise Clover brand codes to human-readable names (mirrors official plugin).
+	 *
+	 * @param string $card_brand Raw brand from the API.
+	 * @return string
+	 */
+	protected function normalize_card_brand($card_brand)
+	{
+		$card_brand = trim((string) $card_brand);
+
+		if ('' === $card_brand) {
+			return '';
+		}
+
+		$brand_map = array(
+			'MC'       => 'MasterCard',
+			'MASTER'   => 'MasterCard',
+			'VISA'     => 'Visa',
+			'AMEX'     => 'American Express',
+			'DISCOVER' => 'Discover',
+			'DINERS'   => 'Diners Club',
+			'JCB'      => 'JCB',
+		);
+
+		$brand_upper = strtoupper($card_brand);
+
+		if (isset($brand_map[$brand_upper])) {
+			return $brand_map[$brand_upper];
+		}
+
+		// Title-case any unrecognised brand so display looks clean.
+		return ucwords(strtolower($card_brand));
+	}
+
+	/**
+	 * Fetch the v3 payment records attached to a Clover order.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return array|null Payment elements, or null when the lookup itself failed.
+	 */
+	protected function get_order_payments($clover_order_id)
+	{
+		$result = $this->request_v3(
+			'GET',
+			'/merchants/' . rawurlencode($this->merchant_id) . '/orders/' . rawurlencode($clover_order_id) . '/payments',
+			array(),
+			array('expand' => 'tender,cardTransaction')
+		);
+
+		if (empty($result['success']) || ! isset($result['data'])) {
+			return null;
+		}
+
+		return isset($result['data']['elements']) && is_array($result['data']['elements'])
+			? $result['data']['elements']
+			: array();
+	}
+
+	/**
+	 * Read tender and card details from the v3 payment attached to a paid order.
+	 *
+	 * The pay-for-order response does not include the v3 payment ID, which the
+	 * WooCommerce admin panels display, so it is fetched from the order.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return array{payment_id:string,tender_label:string,card_brand:string,card_last4:string}
+	 */
+	protected function get_order_payment_details($clover_order_id)
+	{
+		$details = array(
+			'payment_id'   => '',
+			'tender_label' => '',
+			'card_brand'   => '',
+			'card_last4'   => '',
+		);
+
+		$payments = $this->get_order_payments($clover_order_id);
+
+		if (empty($payments)) {
+			return $details;
+		}
+
+		$payment = end($payments);
+
+		if (! empty($payment['id'])) {
+			$details['payment_id'] = (string) $payment['id'];
+		}
+		if (! empty($payment['tender']['label'])) {
+			$details['tender_label'] = (string) $payment['tender']['label'];
+		}
+		if (! empty($payment['cardTransaction']['cardType'])) {
+			$details['card_brand'] = (string) $payment['cardTransaction']['cardType'];
+		}
+		if (! empty($payment['cardTransaction']['last4'])) {
+			$details['card_last4'] = (string) $payment['cardTransaction']['last4'];
+		}
+
+		return $details;
+	}
+
+	/**
+	 * Delete a Clover order that was created for a payment which never completed.
+	 *
+	 * Refuses to delete when the order already carries a payment, or when the
+	 * payment lookup failed — an ambiguous network failure may mean the card was
+	 * charged even though the client saw an error.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return bool True when the order was removed.
+	 */
+	public function abandon_unpaid_order($clover_order_id)
+	{
+		if (empty($clover_order_id)) {
+			return false;
+		}
+
+		$payments = $this->get_order_payments($clover_order_id);
+
+		if (null === $payments) {
+			$this->log(
+				'Keeping order ' . $clover_order_id . ' — could not verify whether it has payments.',
+				'warning'
+			);
+			return false;
+		}
+
+		if (! empty($payments)) {
+			$this->log(
+				'Keeping order ' . $clover_order_id . ' — it already has ' . count($payments) . ' payment(s).',
+				'warning'
+			);
+			return false;
+		}
+
+		return $this->delete_clover_order($clover_order_id);
+	}
+
+	/**
+	 * Whether an eCommerce API error body represents a card decline.
+	 *
+	 * @param array $result Response from request_ecomm().
+	 * @return bool
+	 */
+	protected function is_decline_response($result)
+	{
+		if (402 === (isset($result['http_code']) ? (int) $result['http_code'] : 0)) {
+			return true;
+		}
+
+		$body = isset($result['data']) && is_array($result['data']) ? $result['data'] : array();
+
+		if (! empty($body['error']['decline_code'])) {
+			return true;
+		}
+
+		$haystack = strtolower(
+			(isset($body['error']['code']) ? (string) $body['error']['code'] : '')
+			. ' ' . (isset($body['error']['reason']) ? (string) $body['error']['reason'] : '')
+			. ' ' . (isset($result['message']) ? (string) $result['message'] : '')
+		);
+
+		return false !== strpos($haystack, 'declin');
+	}
+
+	/**
+	 * Whether a failed pay-for-order attempt should retry on the legacy charge endpoint.
+	 *
+	 * The legacy endpoint always creates its own order in Clover, so it is only
+	 * acceptable when Clover deterministically rejected the pay-for-order request
+	 * for a structural reason. Ambiguous failures are never retried: the card may
+	 * already have been charged.
+	 *
+	 * @param array $result Failed result from pay_order().
+	 * @return bool
+	 */
+	protected function should_fallback_to_standalone_charge($result)
+	{
+		if (! empty($result['success']) || ! empty($result['declined'])) {
+			return false;
+		}
+
+		$code = isset($result['http_code']) ? (int) $result['http_code'] : 0;
+
+		if ($code <= 0 || $code >= 500 || in_array($code, array(408, 429), true)) {
+			return false;
+		}
+
+		if (! in_array($code, array(400, 403, 404, 405, 501), true)) {
+			return false;
+		}
+
+		/**
+		 * Filter whether a failed pay-for-order may fall back to POST /v1/charges.
+		 *
+		 * The fallback keeps payments working on merchants where pay-for-order is
+		 * unavailable, at the cost of a second, unitemized order in Clover.
+		 *
+		 * @param bool  $allow  Whether to allow the fallback.
+		 * @param array $result Failed pay-for-order result.
+		 */
+		return (bool) apply_filters('clover_gateway_allow_charge_fallback', true, $result);
+	}
+
+	/**
+	 * Pay for an existing Clover order with a tokenized card.
+	 *
+	 * Uses POST /v1/orders/{orderId}/pay so the payment settles against the order
+	 * we already built with real line items, tax, and the kitchen note. The
+	 * charge endpoint cannot do this — it ignores any order reference and always
+	 * creates a second, unitemized order that shows as "Item 1" on the receipt.
+	 *
+	 * @param string   $card_token      Card token from Clover iframe.
+	 * @param int      $amount_cents    Total amount in cents (includes tax + fees).
+	 * @param string   $clover_order_id Clover order ID.
+	 * @param WC_Order $order           WooCommerce order.
+	 * @return array Same shape as charge_card().
+	 */
+	protected function pay_order($card_token, $amount_cents, $clover_order_id, $order)
+	{
+		$order_id = $order->get_id();
+
+		// Only the keys below are accepted — the endpoint rejects unknown properties.
+		$payload = array(
+			'source'   => $card_token,
+			'amount'   => (int) $amount_cents,
+			'currency' => strtolower($order->get_currency() ?: 'usd'),
+			'ecomind'  => 'ecom',
+			'metadata' => array(
+				'shopping_cart' => 'WP ' . get_bloginfo('version') . ' | WC ' . WC_VERSION . ' | CloverGW ' . WC_CLOVER_GATEWAY_VERSION,
+				'wc_order'      => (string) $order->get_order_number(),
+			),
+		);
+
+		$email = $order->get_billing_email();
+		if ($email) {
+			$payload['email'] = $email;
+		}
+
+		$reference = $this->build_external_reference_id($order);
+		if ('' !== $reference) {
+			$payload['external_reference_id'] = $reference;
+		}
+
+		$result = $this->request_ecomm(
+			'POST',
+			'/orders/' . rawurlencode($clover_order_id) . '/pay',
+			$payload,
+			array(
+				'Idempotency-Key' => $this->generate_idempotency_key($order_id),
+				'X-Forwarded-For' => $this->get_client_ip(),
+			)
+		);
+
+		if (empty($result['success'])) {
+			$message = ! empty($result['message'])
+				? (string) $result['message']
+				: __('Payment could not be processed. Please try again.', 'clover-gateway');
+
+			$declined = $this->is_decline_response($result);
+			if ($declined) {
+				$message = __('Your card was declined. Please try another card.', 'clover-gateway');
+			}
+
+			$this->log(
+				'Pay-for-order failed on ' . $clover_order_id . ': ' . $message
+					. ' | ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result),
+				'error'
+			);
+
+			return array(
+				'success'   => false,
+				'declined'  => $declined,
+				'message'   => $message,
+				'http_code' => isset($result['http_code']) ? (int) $result['http_code'] : 0,
+				'data'      => isset($result['data']) ? $result['data'] : null,
+			);
+		}
+
+		$data        = is_array($result['data']) ? $result['data'] : array();
+		$status      = isset($data['status']) ? strtolower((string) $data['status']) : '';
+		$amount_paid = isset($data['amount_paid']) ? (int) $data['amount_paid'] : 0;
+		$amount_due  = isset($data['amount_due']) ? (int) $data['amount_due'] : 0;
+		$is_paid     = in_array($status, array('paid', 'fulfilled'), true) || $amount_paid >= (int) $amount_cents;
+
+		if (! $is_paid) {
+			$this->log(sprintf(
+				'Pay-for-order not paid: order=%s status=%s amount_paid=%d amount=%d',
+				$clover_order_id,
+				$status ? $status : 'unknown',
+				$amount_paid,
+				(int) $amount_cents
+			), 'error');
+
+			return array(
+				'success'  => false,
+				'declined' => false,
+				'message'  => __('Payment could not be processed. Please try again.', 'clover-gateway'),
+				// Treated as ambiguous: Clover accepted the request but did not report a paid order.
+				'http_code' => 0,
+			);
+		}
+
+		$charge_id = '';
+		if (! empty($data['charge'])) {
+			$charge_id = is_array($data['charge'])
+				? (isset($data['charge']['id']) ? (string) $data['charge']['id'] : '')
+				: (string) $data['charge'];
+		}
+
+		$card_brand     = '';
+		$card_last4     = '';
+		$card_exp_month = '';
+		$card_exp_year  = '';
+
+		if (! empty($data['source']) && is_array($data['source'])) {
+			$src            = $data['source'];
+			$card_brand     = isset($src['brand'])     ? (string) $src['brand'] : '';
+			$card_last4     = isset($src['last4'])     ? trim((string) $src['last4']) : '';
+			$card_exp_month = isset($src['exp_month']) ? str_pad((string) $src['exp_month'], 2, '0', STR_PAD_LEFT) : '';
+			$card_exp_year  = isset($src['exp_year'])  ? (string) $src['exp_year'] : '';
+		}
+
+		$payment = $this->get_order_payment_details($clover_order_id);
+
+		if ('' === $card_brand) {
+			$card_brand = $payment['card_brand'];
+		}
+		if ('' === $card_last4) {
+			$card_last4 = $payment['card_last4'];
+		}
+
+		$card_brand = $this->normalize_card_brand($card_brand);
+
+		if ('' === $charge_id) {
+			$this->log(
+				'Pay-for-order succeeded on ' . $clover_order_id . ' without a charge ID — refunds will need the Clover dashboard.',
+				'warning'
+			);
+		}
+
+		// Clover's own order total can exceed what WooCommerce charged (for example a
+		// merchant-side service charge), which leaves the order short-paid on the POS.
+		if ($amount_due > 0) {
+			$this->log(sprintf(
+				'Pay-for-order left a balance: order=%s status=%s amount_paid=%d amount_due=%d',
+				$clover_order_id,
+				$status ? $status : 'unknown',
+				$amount_paid,
+				$amount_due
+			), 'warning');
+		}
+
+		$this->log(sprintf(
+			'Pay-for-order success: order=%s charge_id=%s payment_id=%s brand=%s last4=%s tender=%s',
+			$clover_order_id,
+			$charge_id,
+			$payment['payment_id'],
+			$card_brand,
+			$card_last4,
+			$payment['tender_label']
+		));
+
+		return array(
+			'success'        => true,
+			'charge_id'      => $charge_id,
+			'payment_id'     => $payment['payment_id'],
+			'card_brand'     => $card_brand,
+			'card_last4'     => $card_last4,
+			'card_exp_month' => $card_exp_month,
+			'card_exp_year'  => $card_exp_year,
+			'tender_label'   => $payment['tender_label'],
+			'amount_due'     => $amount_due,
+			'raw'            => $data,
+		);
+	}
+
+	/**
+	 * Pay for a Clover order with a tokenized card.
+	 *
+	 * Prefers the pay-for-order endpoint so the payment lands on the itemized
+	 * order. Falls back to a standalone charge only when Clover deterministically
+	 * refuses that request.
 	 *
 	 * @param string   $card_token      Card token from Clover iframe.
 	 * @param int      $amount_cents    Total amount in cents (includes tax + fees).
@@ -1543,33 +2113,89 @@ class Clover_API
 	 *     @type string $card_exp_month Two-digit expiry month.
 	 *     @type string $card_exp_year  Four-digit expiry year.
 	 *     @type string $tender_label   Human-readable tender label from Clover, e.g. "Credit Card".
+	 *     @type bool   $duplicate_order Whether Clover created a second, unitemized order.
 	 *     @type array  $raw            Full decoded API response.
 	 * }
 	 */
 	public function charge_card($card_token, $amount_cents, $clover_order_id, $order)
 	{
+		$paid = $this->pay_order($card_token, $amount_cents, $clover_order_id, $order);
+
+		if (! empty($paid['success'])) {
+			return $paid;
+		}
+
+		if (! $this->should_fallback_to_standalone_charge($paid)) {
+			if ($this->is_retryable_payment_failure($paid)) {
+				$this->clear_idempotency_key($order->get_id());
+			}
+
+			return $paid;
+		}
+
+		$this->log(
+			'Falling back to standalone charge for order ' . $clover_order_id
+				. ' — Clover will create a second, unitemized order.',
+			'warning'
+		);
+
+		// Fresh key for the retry: Clover deterministically rejected the pay request,
+		// so nothing was charged and replaying its cached response would be wrong.
+		$this->clear_idempotency_key($order->get_id());
+
+		$charged = $this->create_standalone_charge($card_token, $amount_cents, $clover_order_id, $order);
+
+		if (! empty($charged['success'])) {
+			$charged['duplicate_order'] = true;
+		} elseif ($this->is_retryable_payment_failure($charged)) {
+			$this->clear_idempotency_key($order->get_id());
+		}
+
+		return $charged;
+	}
+
+	/**
+	 * Charge a tokenized card without an order reference (legacy fallback).
+	 *
+	 * Clover always creates a new order for a standalone charge, and that order
+	 * carries a single "Item 1" line rather than the WooCommerce line items.
+	 *
+	 * @param string   $card_token      Card token from Clover iframe.
+	 * @param int      $amount_cents    Total amount in cents (includes tax + fees).
+	 * @param string   $clover_order_id Clover order ID (logging only).
+	 * @param WC_Order $order           WooCommerce order.
+	 *
+	 * @return array Same shape as charge_card().
+	 */
+	protected function create_standalone_charge($card_token, $amount_cents, $clover_order_id, $order)
+	{
 		$order_id  = $order->get_id();
 		$currency  = strtolower($order->get_currency() ?: 'usd');
 		$tax_cents = (int) round((float) $order->get_total_tax() * 100);
 
-		// Resolve the customer's IP for Clover fraud signals.
-		$ip = class_exists('WC_Geolocation')
-			? WC_Geolocation::get_ip_address()
-			: sanitize_text_field(wp_unslash(isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : ''));
+		$ip = $this->get_client_ip();
 
 		$payload = array(
 			'source'                       => $card_token,
 			'amount'                       => (int) $amount_cents,
 			'currency'                     => $currency,
-			'orderId'                      => $clover_order_id,
 			'capture'                      => true,
+			'ecomind'                      => 'ecom',
 			'description'                  => 'WooCommerce Order #' . $order->get_order_number(),
-			'external_reference_id'        => (string) $order_id,
+			'external_reference_id'        => $this->build_external_reference_id($order),
 			'metadata'                     => array(
 				'shopping_cart' => 'WP ' . get_bloginfo('version') . ' | WC ' . WC_VERSION . ' | CloverGW ' . WC_CLOVER_GATEWAY_VERSION,
 			),
 			'skip_default_convenience_fee' => true,
 		);
+
+		// Only reference an existing Clover order when one was pre-created.
+		// The eCommerce API auto-creates its own order for every charge regardless,
+		// so passing order_id here does NOT prevent the duplicate — callers should
+		// populate the auto-created order afterward instead of pre-creating one.
+		if ( ! empty( $clover_order_id ) ) {
+			$payload['order_id'] = $clover_order_id;
+		}
 
 		if ($tax_cents > 0) {
 			$payload['tax_amount'] = $tax_cents;
@@ -1594,31 +2220,38 @@ class Clover_API
 		// Idempotency key: prevents duplicate charges on accidental double-submit.
 		$extra_headers = array(
 			'Idempotency-Key' => $this->generate_idempotency_key($order_id),
+			'X-Forwarded-For' => $ip,
 		);
-		if ($ip) {
-			$extra_headers['X-Forwarded-For'] = $ip;
-		}
 
 		$result = $this->request_ecomm('POST', '/charges', $payload, $extra_headers);
 
 		if (! $result['success'] || empty($result['data']['id'])) {
-			$message = __('Payment could not be processed. Please try again.', 'clover-gateway');
+			$message = ! empty($result['message'])
+				? $result['message']
+				: __('Payment could not be processed. Please try again.', 'clover-gateway');
 
-			if (! empty($result['data']['error']['reason'])) {
-				$reason = strtolower((string) $result['data']['error']['reason']);
-				if (false !== strpos($reason, 'declined')) {
-					$message = __('Your card was declined. Please try another card.', 'clover-gateway');
-				}
-			} elseif (! empty($result['data']['error']['message'])) {
-				$this->log('Charge error: ' . $result['data']['error']['message'], 'error');
+			$declined = $this->is_decline_response($result);
+			if ($declined) {
+				$message = __('Your card was declined. Please try another card.', 'clover-gateway');
 			}
 
-			return array('success' => false, 'message' => $message);
+			$this->log('Charge failed: ' . $message . ' | ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result), 'error');
+
+			return array(
+				'success'   => false,
+				'declined'  => $declined,
+				'message'   => $message,
+				'http_code' => isset($result['http_code']) ? (int) $result['http_code'] : 0,
+			);
 		}
 
 		$data = $result['data'];
 
-		if (!isset($data['paid']) || true !== $data['paid']) {
+		$is_paid = (isset($data['paid']) && true === $data['paid'])
+			|| (isset($data['status']) && 'succeeded' === $data['status'])
+			|| (isset($data['captured']) && true === $data['captured']);
+
+		if (! $is_paid) {
 			$this->log(sprintf(
 				'Charge not paid: charge_id=%s status=%s amount=%s paid=%s order_id=%s',
 				$data['id'],
@@ -1654,7 +2287,7 @@ class Clover_API
 
 		if (! empty($data['source']) && is_array($data['source'])) {
 			$src            = $data['source'];
-			$card_brand     = isset($src['brand'])     ? strtoupper(trim((string) $src['brand']))     : '';
+			$card_brand     = isset($src['brand'])     ? trim((string) $src['brand'])                : '';
 			$card_last4     = isset($src['last4'])      ? trim((string) $src['last4'])                : '';
 			$card_exp_month = isset($src['exp_month'])  ? str_pad((string) $src['exp_month'], 2, '0', STR_PAD_LEFT) : '';
 			$card_exp_year  = isset($src['exp_year'])   ? (string) $src['exp_year']                  : '';
@@ -1673,7 +2306,7 @@ class Clover_API
 			if (! empty($payment['cardTransaction']) && is_array($payment['cardTransaction'])) {
 				$ct = $payment['cardTransaction'];
 				if (empty($card_brand) && ! empty($ct['cardType'])) {
-					$card_brand = strtoupper(trim((string) $ct['cardType']));
+					$card_brand = trim((string) $ct['cardType']);
 				}
 				if (empty($card_last4) && ! empty($ct['last4'])) {
 					$card_last4 = trim((string) $ct['last4']);
@@ -1681,37 +2314,246 @@ class Clover_API
 			}
 		}
 
-		// Normalise brand codes to human-readable names (mirrors official plugin).
-		$brand_map = array(
-			'MC'      => 'MasterCard',
-			'MASTER'  => 'MasterCard',
-			'VISA'    => 'Visa',
-			'AMEX'    => 'American Express',
-			'DISCOVER' => 'Discover',
-			'DINERS'  => 'Diners Club',
-			'JCB'     => 'JCB',
-		);
-		$brand_upper = strtoupper($card_brand);
-		if (isset($brand_map[$brand_upper])) {
-			$card_brand = $brand_map[$brand_upper];
-		} elseif ($card_brand) {
-			// Title-case any unrecognised brand so display looks clean.
-			$card_brand = ucwords(strtolower($card_brand));
+		$card_brand = $this->normalize_card_brand($card_brand);
+
+		// Extract the order ID that the eCommerce API auto-created for this charge.
+		// This is the order that actually carries the payment / tender — callers
+		// should populate it with real line items instead of pre-creating a v3 order.
+		//
+		// Per Clover's documented /v1/charges response, the order reference is a
+		// PLAIN STRING at the top level: {"id":"...","order":"WFCWS95Z8E4GR",...}.
+		// It is NOT nested under payment.order.id — that path never matches, which
+		// silently skipped populate_ecomm_order_with_items() and left the "Item 1"
+		// placeholder line on every charge-created order. Check the documented
+		// string field first, then fall back to object-shaped variants defensively
+		// in case Clover returns a different shape for some accounts/API versions.
+		$ecomm_order_id = '';
+		if ( ! empty( $data['order'] ) && is_string( $data['order'] ) ) {
+			$ecomm_order_id = (string) $data['order'];
+		} elseif ( ! empty( $data['order']['id'] ) ) {
+			$ecomm_order_id = (string) $data['order']['id'];
+		} elseif ( ! empty( $data['payment']['order']['id'] ) ) {
+			$ecomm_order_id = (string) $data['payment']['order']['id'];
+		} elseif ( ! empty( $data['payment']['order'] ) && is_string( $data['payment']['order'] ) ) {
+			$ecomm_order_id = (string) $data['payment']['order'];
+		}
+
+		if ( empty( $ecomm_order_id ) ) {
+			// Log the full raw response so a future shape mismatch is diagnosable
+			// from WC > Status > Logs > clover-gateway without guessing again.
+			$this->log(
+				'charge_card: could not find auto-created order id in charge response — raw=' . wp_json_encode( $data ),
+				'error'
+			);
 		}
 
 		$this->log(sprintf(
-			'Charge success: charge_id=%s payment_id=%s brand=%s last4=%s tender=%s order_id=%s',
+			'Charge success: charge_id=%s payment_id=%s brand=%s last4=%s tender=%s requested_order=%s ecomm_order=%s',
 			$data['id'],
 			$payment_id,
 			$card_brand,
 			$card_last4,
 			$tender_label,
-			$clover_order_id
+			$clover_order_id,
+			$ecomm_order_id
 		));
 
 		return array(
+			'success'         => true,
+			'charge_id'       => $data['id'],
+			'payment_id'      => $payment_id,
+			'ecomm_order_id'  => $ecomm_order_id,
+			'card_brand'      => $card_brand,
+			'card_last4'      => $card_last4,
+			'card_exp_month'  => $card_exp_month,
+			'card_exp_year'   => $card_exp_year,
+			'tender_label'    => $tender_label,
+			'raw'             => $data,
+		);
+	}
+
+	/**
+	 * Pay an existing Clover v3 order with a tokenized card.
+	 *
+	 * Clover's documented card flow is: create the order (v3 / atomic_order)
+	 * with real line items, then POST /v1/orders/{orderId}/pay. That attaches
+	 * the card tender to THIS order and flips it to Paid.
+	 *
+	 * Do not use /v1/charges for this. /v1/charges always auto-creates a
+	 * separate order with a generic "Item 1" line — that is the duplicate
+	 * Paid order the dashboard has been showing next to the real Open one.
+	 *
+	 * @param string   $clover_order_id Clover v3 order ID created by create_order_with_items().
+	 * @param string   $card_token      Card token from the Clover iframe (clv_...).
+	 * @param int      $amount_cents    Authorized WooCommerce total in cents.
+	 * @param WC_Order $order           WooCommerce order.
+	 * @return array {
+	 *     @type bool   $success
+	 *     @type string $charge_id
+	 *     @type string $payment_id
+	 *     @type string $card_brand
+	 *     @type string $card_last4
+	 *     @type string $card_exp_month
+	 *     @type string $card_exp_year
+	 *     @type string $tender_label
+	 *     @type string $message
+	 * }
+	 */
+	public function pay_for_order( $clover_order_id, $card_token, $amount_cents, $order ) {
+		if ( empty( $clover_order_id ) || empty( $card_token ) ) {
+			return array(
+				'success' => false,
+				'message' => __( 'Payment could not be processed. Please try again.', 'clover-gateway' ),
+			);
+		}
+
+		$ip = class_exists( 'WC_Geolocation' )
+			? WC_Geolocation::get_ip_address()
+			: sanitize_text_field( wp_unslash( isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : '' ) );
+
+		$payload = array(
+			'source'  => $card_token,
+			'ecomind' => 'ecom',
+			'amount'  => (int) $amount_cents,
+		);
+
+		$tax_cents = (int) round( (float) $order->get_total_tax() * 100 );
+		if ( $tax_cents > 0 ) {
+			$payload['tax_amount'] = $tax_cents;
+		}
+
+		$extra_headers = array(
+			'Idempotency-Key'      => $this->generate_idempotency_key( $order->get_id() ),
+			'X-Clover-Merchant-Id' => (string) $this->merchant_id,
+		);
+		if ( $ip ) {
+			$extra_headers['X-Forwarded-For'] = $ip;
+		}
+
+		$result = $this->request_ecomm(
+			'POST',
+			'/orders/' . rawurlencode( $clover_order_id ) . '/pay',
+			$payload,
+			$extra_headers
+		);
+
+		if ( empty( $result['success'] ) ) {
+			$message = ! empty( $result['message'] )
+				? $result['message']
+				: __( 'Payment could not be processed. Please try again.', 'clover-gateway' );
+
+			if ( ! empty( $result['data']['error']['reason'] ) ) {
+				$reason = strtolower( (string) $result['data']['error']['reason'] );
+				if ( false !== strpos( $reason, 'declined' ) ) {
+					$message = __( 'Your card was declined. Please try another card.', 'clover-gateway' );
+				}
+			}
+
+			$this->log(
+				'Pay-for-order failed on ' . $clover_order_id . ': ' . $message
+					. ' | ' . wp_json_encode( isset( $result['data'] ) ? $result['data'] : $result ),
+				'error'
+			);
+
+			return array( 'success' => false, 'message' => $message );
+		}
+
+		$data = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+
+		$status      = isset( $data['status'] ) ? strtolower( (string) $data['status'] ) : '';
+		$amount_paid = isset( $data['amount_paid'] ) ? (int) $data['amount_paid'] : 0;
+		$is_paid     = in_array( $status, array( 'paid', 'succeeded' ), true )
+			|| ( isset( $data['paid'] ) && true === $data['paid'] )
+			|| ( $amount_paid > 0 && $amount_paid >= (int) $amount_cents )
+			|| ! empty( $data['charge'] );
+
+		if ( ! $is_paid ) {
+			$this->log(
+				'Pay-for-order not paid: order=' . $clover_order_id
+					. ' status=' . $status
+					. ' amount_paid=' . $amount_paid
+					. ' raw=' . wp_json_encode( $data ),
+				'error'
+			);
+			return array(
+				'success' => false,
+				'message' => __( 'Payment could not be processed. Please try again.', 'clover-gateway' ),
+			);
+		}
+
+		$charge_id = '';
+		if ( ! empty( $data['charge'] ) && is_string( $data['charge'] ) ) {
+			$charge_id = (string) $data['charge'];
+		} elseif ( ! empty( $data['charge']['id'] ) ) {
+			$charge_id = (string) $data['charge']['id'];
+		} elseif ( ! empty( $data['id'] ) && ( empty( $data['object'] ) || 'charge' === $data['object'] ) ) {
+			$charge_id = (string) $data['id'];
+		}
+
+		$card_brand     = '';
+		$card_last4     = '';
+		$card_exp_month = '';
+		$card_exp_year  = '';
+		$payment_id     = '';
+		$tender_label   = '';
+
+		if ( ! empty( $data['source'] ) && is_array( $data['source'] ) ) {
+			$src            = $data['source'];
+			$card_brand     = isset( $src['brand'] ) ? strtoupper( trim( (string) $src['brand'] ) ) : '';
+			$card_last4     = isset( $src['last4'] ) ? trim( (string) $src['last4'] ) : '';
+			$card_exp_month = isset( $src['exp_month'] ) ? str_pad( (string) $src['exp_month'], 2, '0', STR_PAD_LEFT ) : '';
+			$card_exp_year  = isset( $src['exp_year'] ) ? (string) $src['exp_year'] : '';
+		}
+
+		if ( ! empty( $data['payment'] ) && is_array( $data['payment'] ) ) {
+			$payment    = $data['payment'];
+			$payment_id = isset( $payment['id'] ) ? (string) $payment['id'] : '';
+			if ( ! empty( $payment['tender']['label'] ) ) {
+				$tender_label = (string) $payment['tender']['label'];
+			}
+			if ( ! empty( $payment['cardTransaction'] ) && is_array( $payment['cardTransaction'] ) ) {
+				$ct = $payment['cardTransaction'];
+				if ( '' === $card_brand && ! empty( $ct['cardType'] ) ) {
+					$card_brand = strtoupper( trim( (string) $ct['cardType'] ) );
+				}
+				if ( '' === $card_last4 && ! empty( $ct['last4'] ) ) {
+					$card_last4 = trim( (string) $ct['last4'] );
+				}
+			}
+		}
+
+		$brand_map = array(
+			'MC'       => 'MasterCard',
+			'MASTER'   => 'MasterCard',
+			'VISA'     => 'Visa',
+			'AMEX'     => 'American Express',
+			'DISCOVER' => 'Discover',
+			'DINERS'   => 'Diners Club',
+			'JCB'      => 'JCB',
+		);
+		$brand_upper = strtoupper( $card_brand );
+		if ( isset( $brand_map[ $brand_upper ] ) ) {
+			$card_brand = $brand_map[ $brand_upper ];
+		} elseif ( $card_brand ) {
+			$card_brand = ucwords( strtolower( $card_brand ) );
+		}
+
+		$this->log(
+			sprintf(
+				'Pay-for-order success: clover_order=%s charge_id=%s payment_id=%s brand=%s last4=%s status=%s amount_paid=%s',
+				$clover_order_id,
+				$charge_id,
+				$payment_id,
+				$card_brand,
+				$card_last4,
+				$status,
+				$amount_paid
+			)
+		);
+
+		return array(
 			'success'        => true,
-			'charge_id'      => $data['id'],
+			'charge_id'      => $charge_id,
 			'payment_id'     => $payment_id,
 			'card_brand'     => $card_brand,
 			'card_last4'     => $card_last4,
@@ -1723,15 +2565,136 @@ class Clover_API
 	}
 
 	/**
-	 * Print order tickets via Clover's documented print_event REST API.
+	 * Delete all line items from a Clover order.
 	 *
-	 * Sends one print_event per category (ORDER, RECEIPT) with a 300 ms gap.
-	 * Records per-category print timestamps as order meta and adds a WC order
-	 * note when any category fails so the merchant has visibility.
+	 * @deprecated Unused as of 1.0.15. Originally added to clear the generic
+	 * "Item 1" line from the eCommerce API's auto-created order before adding
+	 * real items, but Clover auto-locks an order the instant it's paid — these
+	 * calls are silently rejected on the already-paid auto-created order, so
+	 * this approach can never work. See record_external_card_payment() instead.
+	 *
+	 * @param string $clover_order_id Clover order ID.
+	 * @return bool True when all items were deleted (or none existed).
+	 */
+	public function delete_order_line_items( $clover_order_id ) {
+		$fetch = $this->fetch_order_with_line_items( $clover_order_id );
+
+		if ( empty( $fetch['success'] ) || empty( $fetch['order']['lineItems']['elements'] ) ) {
+			return true;
+		}
+
+		foreach ( $fetch['order']['lineItems']['elements'] as $li ) {
+			if ( ! empty( $li['id'] ) ) {
+				$this->request_v3(
+					'DELETE',
+					'/merchants/' . rawurlencode( $this->merchant_id )
+						. '/orders/' . rawurlencode( $clover_order_id )
+						. '/line_items/' . rawurlencode( $li['id'] )
+				);
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Populate a Clover order (auto-created by an eCommerce charge) with proper
+	 * WooCommerce line items, title, note and tax.
+	 *
+	 * @deprecated Unused as of 1.0.15. Clover auto-locks an order the instant a
+	 * payment is taken, so attempting to add/delete line items on the
+	 * eCommerce API's already-paid auto-created order is silently rejected —
+	 * confirmed in production logs (ecomm_order correctly resolved, yet the
+	 * order still showed only the generic "Item 1" line afterward). The fixed
+	 * flow creates the real order first (open, real items) and records the
+	 * charge onto it as an external payment instead; see
+	 * record_external_card_payment() and process_payment() in
+	 * WC_Clover_Gateway.
+	 *
+	 * @param string   $clover_order_id Clover order ID (from ecomm_order_id in charge response).
+	 * @param WC_Order $order           WooCommerce order.
+	 * @return array{success:bool,clover_order_id:string,tax_cents:int,total_cents:int}
+	 */
+	public function populate_ecomm_order_with_items( $clover_order_id, $order ) {
+		$this->ensure_order_totals( $order );
+
+		$this->log( 'populate_ecomm_order: removing generic line items from ' . $clover_order_id );
+		$this->delete_order_line_items( $clover_order_id );
+
+		$line_data  = $this->build_atomic_line_items( $order, true );
+		$line_items = $this->sanitize_line_items_for_api( $line_data['elements'] );
+
+		foreach ( $line_items as $index => $li ) {
+			$name = isset( $li['name'] ) ? $li['name'] : '';
+			$this->log( 'populate_ecomm_order line #' . ( $index + 1 ) . ': ' . $name );
+
+			$this->add_line_item_from_payload( $clover_order_id, $li );
+			usleep( 200000 );
+		}
+
+		$total_cents = (int) round( (float) $order->get_total() * 100 );
+		$tax_cents   = $this->calculate_order_tax_cents( $order );
+
+		$update_data = array(
+			'title' => $this->get_order_title( $order ),
+			'note'  => $this->build_order_note( $order ),
+		);
+
+		if ( $total_cents > 0 ) {
+			$update_data['total'] = $total_cents;
+		}
+		if ( $tax_cents > 0 ) {
+			$update_data['taxAmount'] = $tax_cents;
+		}
+
+		$this->request_v3(
+			'POST',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/orders/' . rawurlencode( $clover_order_id ),
+			$update_data
+		);
+
+		// Wait for Clover to commit line items before print.
+		sleep( 2 );
+
+		if ( function_exists( 'clover_gateway_is_order_debug_enabled' ) && clover_gateway_is_order_debug_enabled() ) {
+			$snapshot = $this->build_atomic_line_items( $order, true );
+			$order->update_meta_data( '_clover_debug_sent_payload', $snapshot['elements'] );
+			$order->update_meta_data( '_clover_debug_sync_path', 'ecomm-populate' );
+			$order->update_meta_data( '_clover_line_format', 'unit-expand-v1.0.13' );
+			$order->update_meta_data( '_clover_debug_saved_at', current_time( 'mysql' ) );
+			$order->save();
+		}
+
+		$this->audit_clover_line_items_after_sync( $clover_order_id, $order );
+
+		return array(
+			'success'         => true,
+			'clover_order_id' => $clover_order_id,
+			'tax_cents'       => $tax_cents,
+			'total_cents'     => $total_cents,
+		);
+	}
+
+	/**
+	 * Fire a Clover print_event for a newly created order.
+	 *
+	 * Respects the "Automatic Kitchen Print" setting. Merchants whose Clover
+	 * device already auto-prints (via DineNGo, OrderOut, or Clover's native
+	 * Setup → Order Receipts auto-print) should disable this setting to avoid
+	 * duplicate kitchen tickets. The manual "Retry print" button on each order
+	 * always fires regardless of this setting (it calls send_print_event()
+	 * directly).
+	 *
+	 * We can't auto-detect whether another app will print the order:
+	 *   - Clover's REST API does not expose a list of installed apps.
+	 *   - Third-party apps like DineNGo use their own printing pipeline and do
+	 *     not update Clover's lineItem.printed flag, so a before-fire check
+	 *     against that flag is unreliable.
 	 *
 	 * @param string   $clover_order_id Clover order ID.
 	 * @param int|null $wc_order_id     WooCommerce order ID (for notes + meta).
-	 * @return bool True when all requested print categories succeed.
+	 * @param bool     $used_sequential Whether the sequential line-item path was used.
+	 * @return bool True on success (or when deliberately skipped).
 	 */
 	public function fire_order( $clover_order_id, $wc_order_id = null, $used_sequential = false ) {
 		if ( empty( $clover_order_id ) ) {
@@ -1745,27 +2708,71 @@ class Clover_API
 			$used_sequential ? 'yes' : 'no'
 		) );
 
+		// Setting: "Automatic Kitchen Print" — merchants with a Clover printing
+		// app installed (DineNGo, OrderOut, etc.) disable this to prevent dupes.
+		$settings  = get_option( 'woocommerce_clover_gateway_settings', array() );
+		$auto_print = is_array( $settings ) && isset( $settings['auto_print'] )
+			? ( 'yes' === $settings['auto_print'] )
+			: true; // default ON for backward compatibility
+
 		/**
-		 * Print categories for API-created orders.
+		 * Last-chance filter to override the auto-print setting per-order.
 		 *
-		 * @param string[] $categories e.g. array( 'ORDER', 'RECEIPT' ).
+		 * @param bool     $auto_print       Whether to fire print_event automatically.
+		 * @param string   $clover_order_id  Clover order ID.
+		 * @param int|null $wc_order_id      WooCommerce order ID.
 		 */
-		$categories = apply_filters( 'clover_gateway_print_categories', array( 'ORDER', 'RECEIPT' ) );
+		$auto_print = (bool) apply_filters( 'clover_gateway_auto_print', $auto_print, $clover_order_id, $wc_order_id );
+
+		if ( ! $auto_print ) {
+			$this->log( sprintf(
+				'fire_order() SKIPPED — Automatic Kitchen Print is OFF (device/app handles printing). clover_order=%s wc_order=%s',
+				$clover_order_id,
+				$wc_order_id ? $wc_order_id : 'null'
+			) );
+			return true;
+		}
+
+		// Guard: skip if this plugin already fired print for this WC order.
+		if ( $wc_order_id ) {
+			$wc_order = wc_get_order( $wc_order_id );
+			if ( $wc_order && $wc_order->get_meta( '_clover_print_fired_order' ) ) {
+				$this->log( sprintf(
+					'fire_order() SKIPPED — already printed by plugin: clover_order=%s wc_order=%s',
+					$clover_order_id,
+					$wc_order_id
+				) );
+				return true;
+			}
+		}
+
+		return $this->send_print_event( $clover_order_id, $wc_order_id );
+	}
+
+	/**
+	 * Send the actual print_event API call(s). Bypasses the auto_print setting
+	 * — used by fire_order() (after the setting check) and by the manual
+	 * "Retry print" admin button.
+	 *
+	 * @param string   $clover_order_id Clover order ID.
+	 * @param int|null $wc_order_id     WooCommerce order ID.
+	 * @return bool True when all categories succeed.
+	 */
+	public function send_print_event( $clover_order_id, $wc_order_id = null ) {
+		/** @var string[] $categories */
+		$categories = apply_filters( 'clover_gateway_print_categories', array( 'ORDER' ) );
 		if ( empty( $categories ) ) {
 			return false;
 		}
 
 		$any_success       = false;
 		$failed_categories = array();
-
-		// Wait for Clover to commit line items before print. Sequential path already slept 2s.
-		if ( ! $used_sequential ) {
-			usleep( 1500000 ); // 1.5 seconds for atomic orders
-		}
+		$wc_order          = null;
 
 		foreach ( $categories as $category ) {
-			// Delay between print categories (ORDER, RECEIPT) to avoid race conditions.
-			usleep( 800000 ); // 800ms
+			if ( $any_success ) {
+				usleep( 800000 );
+			}
 
 			$result = $this->request_v3(
 				'POST',
@@ -1786,7 +2793,11 @@ class Clover_API
 				) );
 
 				if ( $wc_order_id ) {
-					update_post_meta( $wc_order_id, '_clover_print_fired_' . strtolower( $category ), current_time( 'mysql' ) );
+					$wc_order = $wc_order ?: wc_get_order( $wc_order_id );
+					if ( $wc_order ) {
+						$wc_order->update_meta_data( '_clover_print_fired_' . strtolower( $category ), current_time( 'mysql' ) );
+						$wc_order->save();
+					}
 				}
 			} else {
 				$failed_categories[] = $category;
@@ -1799,14 +2810,21 @@ class Clover_API
 			}
 		}
 
-		if ( ! empty( $failed_categories ) && $wc_order_id ) {
-			$wc_order = wc_get_order( $wc_order_id );
+		if ( $any_success && $wc_order_id ) {
+			$wc_order = $wc_order ?: wc_get_order( $wc_order_id );
 			if ( $wc_order ) {
-				$cats_string = implode( ', ', $failed_categories );
+				$wc_order->update_meta_data( '_clover_print_fired_order', 'plugin:' . current_time( 'mysql' ) );
+				$wc_order->save();
+			}
+		}
+
+		if ( ! empty( $failed_categories ) && $wc_order_id ) {
+			$wc_order = $wc_order ?: wc_get_order( $wc_order_id );
+			if ( $wc_order ) {
 				$wc_order->add_order_note(
 					sprintf(
 						'Clover print failed for: %1$s. Clover order ID: %2$s. Ensure your Clover device is online. <a href="#" class="clover-retry-print" data-order-id="%3$d">Retry print</a>',
-						esc_html( $cats_string ),
+						esc_html( implode( ', ', $failed_categories ) ),
 						esc_html( $clover_order_id ),
 						$wc_order_id
 					),
@@ -1817,6 +2835,165 @@ class Clover_API
 		}
 
 		return empty( $failed_categories ) && $any_success;
+	}
+
+	/**
+	 * Fetch every item-stock record for this merchant.
+	 *
+	 * Keyed by Clover item ID. Items with no numeric quantity are omitted so the
+	 * importer can leave those WooCommerce products unchanged.
+	 *
+	 * @return array{success:bool,stocks?:array<string,int|float>,message?:string}
+	 */
+	public function get_all_item_stocks()
+	{
+		$stocks = array();
+		$offset = 0;
+		$limit  = 100;
+		$pages  = 0;
+
+		do {
+			++$pages;
+			if ( $pages > 500 ) {
+				return array(
+					'success' => false,
+					'message' => __( 'Clover returned more item-stock pages than this import can read.', 'clover-gateway' ),
+				);
+			}
+
+			$result = $this->request_v3(
+				'GET',
+				'/merchants/' . rawurlencode( $this->merchant_id ) . '/item_stocks',
+				array(),
+				array(
+					'limit'  => $limit,
+					'offset' => $offset,
+					'expand' => 'item',
+				)
+			);
+
+			if ( empty( $result['success'] ) ) {
+				return array(
+					'success' => false,
+					'message' => ! empty( $result['message'] )
+						? (string) $result['message']
+						: __( 'Could not read Clover item stock.', 'clover-gateway' ),
+				);
+			}
+
+			$elements = array();
+			if ( ! empty( $result['data']['elements'] ) && is_array( $result['data']['elements'] ) ) {
+				$elements = $result['data']['elements'];
+			}
+
+			foreach ( $elements as $row ) {
+				if ( ! is_array( $row ) ) {
+					continue;
+				}
+
+				$item_id = '';
+				if ( ! empty( $row['item']['id'] ) ) {
+					$item_id = (string) $row['item']['id'];
+				} elseif ( ! empty( $row['id'] ) ) {
+					$item_id = (string) $row['id'];
+				}
+				$item_id = trim( $item_id );
+				if ( '' === $item_id ) {
+					continue;
+				}
+
+				if ( array_key_exists( 'quantity', $row ) && is_numeric( $row['quantity'] ) ) {
+					$stocks[ $item_id ] = 0 + $row['quantity'];
+				} elseif ( ! array_key_exists( 'quantity', $row ) && array_key_exists( 'stockCount', $row ) && is_numeric( $row['stockCount'] ) ) {
+					$stocks[ $item_id ] = 0 + $row['stockCount'];
+				}
+			}
+
+			$offset += $limit;
+		} while ( count( $elements ) === $limit );
+
+		return array(
+			'success' => true,
+			'stocks'  => $stocks,
+		);
+	}
+
+	/**
+	 * Read one item's stock quantity.
+	 *
+	 * A missing stock record means Clover is not tracking that item. The quantity
+	 * is null in that case so a sale is not written as zero.
+	 *
+	 * @param string $item_id Clover item ID.
+	 * @return array{success:bool,quantity?:int|float|null,tracked?:bool,message?:string}
+	 */
+	public function get_item_stock_quantity( $item_id )
+	{
+		$result = $this->request_v3(
+			'GET',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/item_stocks/' . rawurlencode( $item_id )
+		);
+
+		if ( empty( $result['success'] ) ) {
+			$code = isset( $result['http_code'] ) ? (int) $result['http_code'] : 0;
+			if ( 404 === $code ) {
+				return array(
+					'success'  => true,
+					'quantity' => null,
+					'tracked'  => false,
+				);
+			}
+			return array(
+				'success' => false,
+				'message' => ! empty( $result['message'] ) ? (string) $result['message'] : __( 'Could not read Clover stock.', 'clover-gateway' ),
+			);
+		}
+
+		$data = isset( $result['data'] ) && is_array( $result['data'] ) ? $result['data'] : array();
+		if ( array_key_exists( 'quantity', $data ) && is_numeric( $data['quantity'] ) ) {
+			return array(
+				'success'  => true,
+				'quantity' => 0 + $data['quantity'],
+				'tracked'  => true,
+			);
+		}
+		if ( array_key_exists( 'stockCount', $data ) && is_numeric( $data['stockCount'] ) ) {
+			return array(
+				'success'  => true,
+				'quantity' => 0 + $data['stockCount'],
+				'tracked'  => true,
+			);
+		}
+
+		return array(
+			'success'  => true,
+			'quantity' => null,
+			'tracked'  => false,
+		);
+	}
+
+	/**
+	 * Set one item's stock quantity.
+	 *
+	 * @param string    $item_id  Clover item ID.
+	 * @param int|float $quantity New absolute quantity.
+	 * @return array
+	 */
+	public function set_item_stock_quantity( $item_id, $quantity )
+	{
+		$path   = '/merchants/' . rawurlencode( $this->merchant_id ) . '/item_stocks/' . rawurlencode( $item_id );
+		$body   = array( 'quantity' => $quantity );
+		$result = $this->request_v3( 'PUT', $path, $body );
+		if ( ! empty( $result['success'] ) ) {
+			return $result;
+		}
+
+		$code = isset( $result['http_code'] ) ? (int) $result['http_code'] : 0;
+		if ( in_array( $code, array( 404, 405 ), true ) ) {
+			$result = $this->request_v3( 'POST', $path, $body );
+		}
+
+		return $result;
 	}
 
 	/**
@@ -1892,6 +3069,73 @@ class Clover_API
 	}
 
 	/**
+	 * Fetch all merchant tenders (cached per-instance for one request).
+	 *
+	 * @return array<int,array<string,mixed>>
+	 */
+	protected function get_merchant_tenders() {
+		if ( null !== $this->cached_tenders ) {
+			return $this->cached_tenders;
+		}
+
+		$result = $this->request_v3(
+			'GET',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/tenders'
+		);
+
+		if ( ! $result['success'] || empty( $result['data']['elements'] ) ) {
+			$this->log( 'Could not fetch tenders for merchant ' . $this->merchant_id, 'error' );
+			$this->cached_tenders = array();
+			return array();
+		}
+
+		$this->cached_tenders = (array) $result['data']['elements'];
+		return $this->cached_tenders;
+	}
+
+	/**
+	 * Fetch a merchant tender's ID by its Clover system labelKey.
+	 *
+	 * Only matches genuine Clover system tenders (Cash, Check, External
+	 * Payment, etc. when exposed as a toggle). Many merchant accounts don't
+	 * surface the "External Payment" system tender in the Tenders UI at all —
+	 * use get_tender_id_by_label() as a fallback for those accounts, where
+	 * staff instead create a CUSTOM tender literally named "External Payment"
+	 * (custom tenders have no system labelKey, only a merchant-chosen label).
+	 *
+	 * @param string $label_key e.g. 'com.clover.tender.cash', 'com.clover.tender.external_payment'.
+	 * @return string|null Tender ID, or null when not found.
+	 */
+	protected function get_tender_id_by_label_key( $label_key ) {
+		foreach ( $this->get_merchant_tenders() as $tender ) {
+			if ( isset( $tender['labelKey'] ) && $tender['labelKey'] === $label_key ) {
+				return $tender['id'];
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Fetch a merchant tender's ID by its display label (case-insensitive,
+	 * trimmed). Used for custom tenders, which have no system labelKey.
+	 *
+	 * @param string $label Tender label to match, e.g. 'External Payment'.
+	 * @return string|null Tender ID, or null when not found.
+	 */
+	protected function get_tender_id_by_label( $label ) {
+		$needle = strtolower( trim( $label ) );
+
+		foreach ( $this->get_merchant_tenders() as $tender ) {
+			if ( isset( $tender['label'] ) && strtolower( trim( (string) $tender['label'] ) ) === $needle ) {
+				return $tender['id'];
+			}
+		}
+
+		return null;
+	}
+
+	/**
 	 * Fetch the merchant's cash tender ID from Clover.
 	 * The tender ID is merchant-specific and required for the payments endpoint.
 	 * Used when recording a cash payment via add_cash_tender() (e.g. optional COD-as-paid flow).
@@ -1900,24 +3144,39 @@ class Clover_API
 	 */
 	protected function get_cash_tender_id()
 	{
-		$result = $this->request_v3(
-			'GET',
-			'/merchants/' . rawurlencode($this->merchant_id) . '/tenders'
-		);
+		return $this->get_tender_id_by_label_key( 'com.clover.tender.cash' );
+	}
 
-		if (! $result['success'] || empty($result['data']['elements'])) {
-			$this->log('Could not fetch tenders for merchant ' . $this->merchant_id, 'error');
-			return null;
+	/**
+	 * Fetch the merchant's "External Payment" tender ID.
+	 *
+	 * Used to record a card charge that was already processed through the
+	 * Clover eCommerce API (`/v1/charges`) onto the REAL v3 order (the one with
+	 * proper line items), instead of relying on the throwaway order the
+	 * eCommerce API auto-creates for every charge. Per Clover docs, the
+	 * `/orders/{orderId}/payments` endpoint "references external tenders and
+	 * logs them for bookkeeping purposes — this is not for Clover credit/debit
+	 * tenders" — i.e. this is the documented, correct tender for this use case.
+	 *
+	 * Tries two paths because merchant accounts vary:
+	 *   1. The genuine Clover system tender (labelKey com.clover.tender.external_payment),
+	 *      on accounts where the Tenders UI exposes it as a toggle.
+	 *   2. A CUSTOM tender literally named "External Payment" — most accounts
+	 *      don't surface the system tender at all, so staff create this via
+	 *      Settings → Payment Preferences → Tenders → Create custom tender.
+	 *      Filterable in case a merchant uses a different custom tender name.
+	 *
+	 * @return string|null External payment tender ID, or null when neither exists.
+	 */
+	protected function get_external_payment_tender_id() {
+		$id = $this->get_tender_id_by_label_key( 'com.clover.tender.external_payment' );
+		if ( ! empty( $id ) ) {
+			return $id;
 		}
 
-		foreach ($result['data']['elements'] as $tender) {
-			if (isset($tender['labelKey']) && $tender['labelKey'] === 'com.clover.tender.cash') {
-				return $tender['id'];
-			}
-		}
+		$custom_label = (string) apply_filters( 'clover_gateway_external_payment_tender_label', 'External Payment' );
 
-		$this->log('Cash tender not found in merchant tenders list', 'warning');
-		return null;
+		return $this->get_tender_id_by_label( $custom_label );
 	}
 
 	/**
@@ -1960,6 +3219,73 @@ class Clover_API
 		}
 
 		$this->log('Failed to add cash tender to order ' . $clover_order_id . ' — ' . wp_json_encode(isset($result['data']) ? $result['data'] : $result), 'error');
+		return false;
+	}
+
+	/**
+	 * Record an already-processed Clover eCommerce charge as an external payment
+	 * on the REAL v3 order (the one created with proper WooCommerce line items).
+	 *
+	 * Root cause this works around: the eCommerce API's `/v1/charges` endpoint
+	 * ALWAYS auto-creates its own separate order to hold the payment — passing an
+	 * existing `order_id` does not link to it, and the auto-created order gets
+	 * locked the instant it's paid, so it can never be edited with real line
+	 * items afterward either. Instead of fighting that, we create the real order
+	 * ourselves (open, with real items) and then attach the payment that was
+	 * already captured via the eCommerce charge, using Clover's documented
+	 * "external tender" bookkeeping mechanism (`com.clover.tender.external_payment`
+	 * + `externalPaymentId`). This is the same pattern `add_cash_tender()` already
+	 * uses successfully to flip COD orders to Paid in the Clover dashboard.
+	 *
+	 * @param string $clover_order_id      Clover v3 order ID (the real order with line items).
+	 * @param int    $amount_cents         Total charged amount in cents.
+	 * @param int    $tax_cents            Tax amount in cents (for Tax Report).
+	 * @param string $external_payment_id  Reference ID for the payment — the Clover eCommerce charge_id.
+	 * @return bool True when the payment was recorded on the order.
+	 */
+	public function record_external_card_payment( $clover_order_id, $amount_cents, $tax_cents = 0, $external_payment_id = '' ) {
+		$tender_id = $this->get_external_payment_tender_id();
+
+		if ( empty( $tender_id ) ) {
+			$this->log(
+				'No "External Payment" tender found for this merchant (checked both the system tender and a '
+					. 'custom tender named "External Payment") — cannot record the card charge on order '
+					. $clover_order_id . '. Add a custom tender named "External Payment" under Clover Dashboard → '
+					. 'Settings → Payment Preferences → Tenders → Create custom tender, or the order will stay Open.',
+				'error'
+			);
+			return false;
+		}
+
+		$payload = array(
+			'tender'    => array( 'id' => $tender_id ),
+			'amount'    => (int) $amount_cents,
+			'tipAmount' => 0,
+		);
+
+		if ( $tax_cents > 0 ) {
+			$payload['taxAmount'] = (int) $tax_cents;
+		}
+		if ( $external_payment_id ) {
+			$payload['externalPaymentId'] = (string) $external_payment_id;
+		}
+
+		$result = $this->request_v3(
+			'POST',
+			'/merchants/' . rawurlencode( $this->merchant_id ) . '/orders/' . rawurlencode( $clover_order_id ) . '/payments',
+			$payload
+		);
+
+		if ( ! empty( $result['success'] ) ) {
+			$this->log( 'Recorded external payment on order ' . $clover_order_id . ' (external_payment_id=' . $external_payment_id . ')' );
+			return true;
+		}
+
+		$this->log(
+			'Failed to record external payment on order ' . $clover_order_id . ' — '
+				. wp_json_encode( isset( $result['data'] ) ? $result['data'] : $result ),
+			'error'
+		);
 		return false;
 	}
 
@@ -2022,7 +3348,7 @@ class Clover_API
 			'GET',
 			'/merchants/' . rawurlencode( $this->merchant_id ) . '/orders/' . rawurlencode( $clover_order_id ),
 			array(),
-			array( 'expand' => 'lineItems' )
+			array( 'expand' => 'lineItems.item' )
 		);
 
 		if ( empty( $result['success'] ) || empty( $result['data'] ) ) {
@@ -2102,7 +3428,7 @@ class Clover_API
 			}
 
 			$unit_qty = isset( $li['unitQty'] ) ? (int) $li['unitQty'] : 0;
-			$qty_sold = isset( $li['quantitySold'] ) ? (float) $li['quantitySold'] : ( $unit_qty > 0 ? $unit_qty / 1000 : 0 );
+			$qty_sold = isset( $li['quantitySold'] ) ? (float) $li['quantitySold'] : ( $unit_qty > 0 ? $unit_qty / 1000 : 1 );
 			$printed  = array_key_exists( 'printed', $li ) ? (bool) $li['printed'] : null;
 
 			$item_id = '';
@@ -2136,7 +3462,7 @@ class Clover_API
 	 * @return string
 	 */
 	protected function format_pos_quantity_display( $unit_qty, $qty_sold, $printed ) {
-		$qty = (int) round( $qty_sold > 0 ? $qty_sold : ( $unit_qty / 1000 ) );
+		$qty = (int) round( $qty_sold > 0 ? $qty_sold : ( $unit_qty > 0 ? $unit_qty / 1000 : 1 ) );
 
 		if ( false === $printed ) {
 			return 'x1/0';
@@ -2177,6 +3503,10 @@ class Clover_API
 				if ( false === $clover['printed'] ) {
 					$status  = 'warn';
 					$notes[] = __( 'not printed — POS may show x1/0', 'clover-gateway' );
+				}
+				if ( ! empty( $clover['item_id'] ) ) {
+					$status  = 'error';
+					$notes[] = __( 'Clover linked catalog inventory — causes x1/1 on POS/kitchen', 'clover-gateway' );
 				}
 				if ( 'x1/0' === $clover['display_qty'] ) {
 					$status  = 'error';

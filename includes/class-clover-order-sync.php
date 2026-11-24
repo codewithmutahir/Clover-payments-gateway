@@ -356,6 +356,8 @@ class Clover_Order_Sync {
 			$creds['default_tax_rate_id']
 		);
 
+		// Same item/tax builder as card checkout. COD stays Open on purpose —
+		// cash is collected at pickup, so we do not attach a cash tender here.
 		$result = $api->create_order_with_items( $order );
 		if ( empty( $result['success'] ) ) {
 			if ( ! $force ) {

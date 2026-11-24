@@ -1,6 +1,110 @@
 *** Clover Payment Gateway for WooCommerce Changelog ***
 
-2026-06-28 - version 1.0.3
+2026-10-31 - version 1.0.26
+* Fix - Unchecking "Keep linked stock updated from Clover every 15 minutes" now reliably saves OFF (admin-post + hidden "no" field) and clears WP-Cron / Action Scheduler jobs plus the reconcile lock.
+* Add - Restock section on WooCommerce → Clover Sync: put linked / previously synced products back In Stock. Default turns off Manage stock so the shop stops going OOS from Clover quantities; optional mode sets a fixed quantity instead.
+* Note - Turning the stock check OFF does not undo quantities already written. Use Restock after disabling if products show out of stock.
+
+2026-10-26 - version 1.0.25
+* Fix - Kitchen/receipt tickets showing garbage inside product names (e.g. "C| 6s8hicken" instead of "Chicken"). The previous kitchen-safe name hack inserted a zero-width non-joiner (U+200C) that thermal printers cannot render. Names are now plain printable text only.
+* Fix - Strip zero-width / control characters from all Clover line item names and order notes before sync so product titles or customer notes cannot leak unprintable Unicode onto tickets.
+* Note - Catalog 1/1 quantity display is still prevented by ad-hoc lines (no item.id) and omitting unitQty; do not reintroduce invisible Unicode into line names.
+
+2026-10-21 - version 1.0.24
+* Add - Setting "Automatic Kitchen Print" under WooCommerce → Settings → Payments → Clover Payments. Default ON (prints via Clover print_event API after each order). Disable it if the Clover device already auto-prints incoming orders — for example via a Clover marketplace app (DineNGo, OrderOut, etc.) or Clover's native Setup → Order Receipts auto-print. Leaving it on while another app also prints causes double kitchen tickets.
+* Add - Filter clover_gateway_auto_print to override the setting per-order.
+* Note - The deferred-print / auto-detect approach from 1.0.23 is removed. Clover's REST API does not expose installed apps, and third-party print apps like DineNGo use their own printing pipeline that does not update Clover's lineItem.printed flag, so no reliable auto-detection is possible.
+* Fix - HPOS: print-fired meta uses WC_Order CRUD instead of update_post_meta().
+* Fix - Guard against double-fire within the plugin: fire_order() checks the _clover_print_fired_order meta and skips if the plugin already printed this order.
+* Note - Manual "Retry print" button on each order always fires regardless of the Automatic Kitchen Print setting.
+
+2026-10-14 - version 1.0.22
+* Add - A website order that reduces WooCommerce stock also reduces the linked Clover item by the quantity sold. Cancelling or refunding that order puts the quantity back. The change is recorded on the order line so a retry does not apply it twice. Items Clover is not tracking are left unchanged and noted on the order.
+
+2026-10-14 - version 1.0.21
+* Add - Variations such as Full Tray and Half tray auto-match the single Clover item named like the dish, and both keep that same quantity. A size-specific Clover item is still preferred when its name includes the size.
+* Add - Optional stock check every 15 minutes copies Clover quantities onto linked WooCommerce products. Leave it off until the links have been reviewed.
+
+2026-10-14 - version 1.0.20
+* Fix - Clicking Link on the match table saved the Clover item, but a reload showed the old Possible Match again because the page was still rendering the dry-sync snapshot. Saved links and skips are now written back into that snapshot, and a reload checks the product meta before showing the row.
+
+2026-10-14 - version 1.0.19
+* Add - Clover Sync matches each WooCommerce variation to its own Clover item by SKU or by parent name plus attribute (for example "Biryani Large"). Variable parents stay in the list as a reminder that parent links do not set variation stock. An automatic link is withheld when two products would claim the same Clover item. Filter the match table to variations, then apply auto-links and import stock again.
+
+2026-10-14 - version 1.0.18
+* Add - WooCommerce → Clover Sync can import stock quantities from Clover onto products that already have a Clover item ID. Images, descriptions, prices, and URLs are not changed. Items with no Clover stock count are left unchanged. Variable parent products are skipped so each variation can be linked on its own.
+
+2026-10-13 - version 1.0.17
+* Fix - Card checkout was still creating two Clover orders because `/v1/charges` always auto-creates a Paid "Item 1" order, and a paid order cannot be deleted afterward. Card payments now create the same v3 order (real item names + taxes) used by COD/pickup, then pay that order with `POST /v1/orders/{orderId}/pay` so Clover flips THAT ticket to Paid. A standalone charge is used only when Clover rejects pay-for-order for a structural reason, and can be disabled with the `clover_gateway_allow_charge_fallback` filter.
+* Fix - A failed card attempt that had already saved `_clover_order_id` was treated as success on retry (no charge). Checkout only short-circuits when `_clover_charge_id` exists or the WooCommerce order is already paid.
+* Fix - When payment fails, delete the unpaid Clover order so the kitchen does not see an Open ticket. If the order already has a payment, or Clover cannot confirm that, the ticket is kept and the retry pays it instead of opening another.
+* Fix - Clear the idempotency key after a decline so a retry with a different card is charged instead of replaying the original response.
+* Fix - Persist Clover order/charge meta with WooCommerce CRUD methods so HPOS stores keep card and COD tickets from colliding.
+* Add - Order note when Clover reports a balance still due after payment, and when the card had to be charged on a separate unitemized order.
+* Note - COD/pickup is unchanged: one Open Clover order via `create_order_with_items()`, skipped for `clover_gateway`, no cash tender (cash is collected at pickup). Kitchen notes now include the WooCommerce payment method title so card vs pickup is obvious on the ticket.
+
+2026-10-09 - version 1.0.16
+* Fix - "External Payment" tender lookup only matched Clover's system labelKey (com.clover.tender.external_payment), but most merchant accounts never expose that as a toggle in Settings -> Payment Preferences -> Tenders; the only way to get an "External Payment" entry there is to add it as a CUSTOM tender, which has a merchant-generated id/label and no system labelKey. This meant record_external_card_payment() always failed to find it on those accounts, so the real order stayed Open and the throwaway order was kept as the fallback. get_external_payment_tender_id() now also falls back to a case-insensitive match on the tender's display label ("External Payment"), covering custom tenders created via the "Create custom tender" field. The custom tender label is filterable via `clover_gateway_external_payment_tender_label` in case a merchant names it differently.
+* Add - `get_merchant_tenders()` (cached per-request) and `get_tender_id_by_label()` in Clover_API.
+
+2026-10-09 - version 1.0.15
+* Fix - Root cause of the duplicate-order bug, for real this time: Clover's eCommerce `/v1/charges` endpoint ALWAYS auto-creates its own order for every charge (order_id in the request body does not link to an existing order), AND Clover auto-locks an order the instant it's paid — so the 1.0.13/1.0.14 approach of charging first and editing the auto-created order afterward could never work; the edit calls were silently rejected by the lock. Reworked the flow to create the real v3 order with proper line items FIRST, charge the card via the eCommerce API separately, then record that charge as an external payment directly on the real order via `POST /orders/{orderId}/payments` with the `com.clover.tender.external_payment` system tender + `externalPaymentId` (the same documented mechanism add_cash_tender() already uses for COD). The eCommerce API's throwaway "Item 1" order is deleted once the real order is confirmed paid.
+* Add - `record_external_card_payment()`, `get_external_payment_tender_id()`, `get_tender_id_by_label_key()` in Clover_API.
+* Note - Requires the merchant to have the "External Payment" tender enabled under Clover Setup → Tenders. If missing, the order stays Open and an order note explains how to fix it (payment is still captured — nothing is lost, just not reflected as Paid in Clover until the tender is enabled and the order is reconciled manually).
+
+2026-10-08 - version 1.0.14
+* Fix - 1.0.13's duplicate-order fix never actually populated the charge-created order: the auto-created order ID was read from the wrong response field (payment.order.id, which Clover's eCommerce API does not return) instead of the documented top-level `order` string field. This silently skipped populate_ecomm_order_with_items() every time, so the Paid order kept showing the generic "Item 1" line with no note. Fixed extraction to read `order` (string) first, with defensive fallbacks, and log the raw charge response when no order id can be found so this is diagnosable from WC > Status > Logs going forward.
+
+2026-10-07 - version 1.0.13
+* Fix - Duplicate Clover orders on card payments: the eCommerce `/v1/charges` API auto-creates its own order (generic "Item 1") even when an existing `order_id` is supplied. Reversed the flow to charge first, then populate the auto-created order with real WooCommerce line items, title, note and tax. Eliminates the Open + Paid duplicate pair.
+* Add - `populate_ecomm_order_with_items()` and `delete_order_line_items()` methods in Clover_API.
+* Add - `ecomm_order_id` field in `charge_card()` response for the auto-created order ID.
+
+2026-08-14 - version 1.0.12
+* Fix - Include WooCommerce customer note and theme order notes (_kr_order_notes) in Clover order note so kitchen tickets show special requests.
+* Fix - Read KR fulfillment meta (_kr_fulfillment_type, _kr_preferred_datetime) for pickup/delivery line on Clover note.
+* Add - Filter clover_gateway_order_note to customize POS/kitchen note text.
+
+2026-07-08 - version 1.0.11
+* Fix - Charge payload uses order_id + ecomind to match official Clover plugin and API docs.
+* Fix - Surface real Clover eCommerce error messages at checkout instead of generic failure text.
+* Fix - Accept charge success when status is succeeded/captured, not only paid=true.
+* Fix - test_mode defaults to off when unset (was incorrectly defaulting to sandbox).
+* Fix - Reset card token after checkout AJAX refresh so retries tokenize again.
+
+2026-07-08 - version 1.0.10
+* Fix - Bind checkout_place_order on form.checkout (WC triggerHandler does not bubble to document.body).
+* Fix - Match official plugin: transresult validation flag, merchantId in Clover SDK, form.submit() after token.
+* Fix - Reset token/validation when card iframe fields change.
+
+2026-07-08 - version 1.0.9
+* Fix - Checkout tokenization: hook WooCommerce checkout_place_order (not form submit) so clover_card_token is sent with AJAX checkout.
+* Fix - Read Clover createToken() result.token as string (clv_…) per SDK docs; accept nested .token.token as fallback.
+* Fix - Remount Clover iframes after updated_checkout when payment markup is replaced.
+
+2026-07-01 - version 1.0.8
+* Fix - Kitchen double-print: fire ORDER category only by default (was ORDER + RECEIPT). Use filter clover_gateway_print_categories to add RECEIPT if needed.
+
+2026-07-01 - version 1.0.7
+* Fix - Root cause of 1/1 on kitchen tickets: never send unitQty; expand each unit into its own ad-hoc line item (qty 2 = two lines). Enable Clover Setup → Group line items to merge on print.
+* Add - Post-sync audit logs order note if Clover still attaches catalog inventory or unitQty.
+
+2026-07-01 - version 1.0.6
+* Fix - Remove "2 x Item" quantity-in-name hack; use unitQty + unit price for qty>1 so kitchen prints "2 Tuesday Deal" not "1  2 x Tuesday Deal".
+* Fix - qty=1 lines still omit unitQty and use kitchen-safe name (catalog match break only).
+
+2026-07-01 - version 1.0.5
+* Fix - Root cause of x1/1 / 1/1: Clover POS matches line item names to catalog inventory (kitchen fire fraction display). Break matching with kitchen-safe ad-hoc names; never send unitQty or item.id.
+* Fix - Use custom order + line_items API as primary path (atomic_order is fallback only).
+* Fix - Debug panel flags when Clover still links a catalog item (expand=lineItems.item).
+
+2026-07-01 - version 1.0.4
+* Fix - Kitchen/POS "1/1" quantity display by omitting unitQty for qty-1 fixed-price line items (Clover treats unitQty as PER_UNIT fractional weight).
+* Fix - Always use ad-hoc line items for WooCommerce order sync to avoid PER_UNIT inventory items showing fraction quantities.
+* Fix - Remove unitQty from shipping, fee, tax, and discount line items.
+
+2026-07-01 - version 1.0.3
+* Fix - Kitchen print "1/1" prefix by removing quantitySold, printed, exchanged fields from line items (matching official plugin).
 * Fix - Clover POS quantity display (x1/0, x1/4) by using ad-hoc line items on sequential sync and invalid _clover_item_id fallback.
 * Fix - Kitchen printing via print_event instead of legacy /fire endpoint.
 * Add - Optional Order Debug Panel on WooCommerce orders (settings checkbox; also shown when WP_DEBUG is on).
