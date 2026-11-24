@@ -167,6 +167,98 @@
 		});
 	});
 
+	// ── RESTOCK ─────────────────────────────────────────────────────────
+
+	var restockTotals = { updated: 0, unchanged: 0, skipped_parent: 0, errors: 0 };
+	var restockNotes = [];
+
+	function showRestockMsg(html, type) {
+		$('#clover-restock-message').html('<div class="notice notice-' + type + '" style="margin-top:12px"><p>' + html + '</p></div>');
+	}
+
+	function finishRestock() {
+		$('#clover-start-restock').prop('disabled', false);
+		$('#clover-restock-spinner').removeClass('is-active');
+	}
+
+	function runRestockBatch(offset, token, mode, quantity) {
+		$.post(clover_sync_params.ajax_url, {
+			action: 'clover_restock_batch',
+			nonce: clover_sync_params.nonce,
+			offset: offset,
+			token: token || '',
+			mode: mode,
+			quantity: quantity
+		}).done(function (res) {
+			if (!res.success) {
+				showRestockMsg(escapeHtml(res.data && res.data.message ? res.data.message : 'Restock failed.'), 'error');
+				finishRestock();
+				return;
+			}
+
+			var d = res.data || {};
+			if (d.empty) {
+				$('#clover-restock-progress').hide();
+				showRestockMsg('No linked or previously synced products found to restock.', 'warning');
+				finishRestock();
+				return;
+			}
+
+			restockTotals.updated += d.updated || 0;
+			restockTotals.unchanged += d.unchanged || 0;
+			restockTotals.skipped_parent += d.skipped_parent || 0;
+			restockTotals.errors += d.errors || 0;
+			if (d.messages && d.messages.length) {
+				restockNotes = restockNotes.concat(d.messages).slice(0, 12);
+			}
+
+			var pct = d.total > 0 ? Math.min(100, Math.round((d.processed / d.total) * 100)) : 100;
+			$('#clover-restock-bar').css('width', pct + '%');
+			$('#clover-restock-progress-text').text(
+				'Processed ' + d.processed + ' of ' + d.total +
+				' — Restocked: ' + restockTotals.updated +
+				', Errors: ' + restockTotals.errors
+			);
+
+			if (d.done) {
+				var html = 'Restock complete. Updated: <strong>' + restockTotals.updated + '</strong>' +
+					' &nbsp;|&nbsp; Variable parents skipped: <strong>' + restockTotals.skipped_parent + '</strong>' +
+					' &nbsp;|&nbsp; Errors: <strong>' + restockTotals.errors + '</strong>';
+				if (restockNotes.length) {
+					html += '<br>' + restockNotes.map(escapeHtml).join('<br>');
+				}
+				showRestockMsg(html, restockTotals.errors > 0 ? 'warning' : 'success');
+				finishRestock();
+			} else {
+				runRestockBatch(d.next_offset, d.token, mode, quantity);
+			}
+		}).fail(function () {
+			showRestockMsg('Request failed. Check your connection and try again.', 'error');
+			finishRestock();
+		});
+	}
+
+	$('#clover-start-restock').on('click', function () {
+		var $btn = $(this);
+		var mode = $('input[name="clover_restock_mode"]:checked').val() || 'disable_tracking';
+		var quantity = parseInt($('#clover-restock-qty').val(), 10) || 100;
+		var msg = mode === 'set_quantity'
+			? 'Set Manage stock ON and quantity to ' + quantity + ' for linked / previously synced products?'
+			: 'Mark linked / previously synced products In Stock and turn OFF Manage stock?';
+
+		confirmModal(msg, function () {
+			restockTotals = { updated: 0, unchanged: 0, skipped_parent: 0, errors: 0 };
+			restockNotes = [];
+			$btn.prop('disabled', true);
+			$('#clover-restock-spinner').addClass('is-active');
+			$('#clover-restock-message').html('');
+			$('#clover-restock-bar').css('width', '0%');
+			$('#clover-restock-progress-text').text('Starting restock\u2026');
+			$('#clover-restock-progress').show();
+			runRestockBatch(0, '', mode, quantity);
+		});
+	});
+
 	// ── EXPORT SECTION ──────────────────────────────────────────────────
 
 	// Load tax rates from Clover into the selector.

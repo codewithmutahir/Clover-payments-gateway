@@ -1343,6 +1343,182 @@ class Clover_Inventory_Sync {
 	}
 
 	/**
+	 * Product IDs eligible for restock (linked to a Clover item).
+	 *
+	 * Variable parents are included so the batch can report/skip them.
+	 * Stock import only runs on linked products, so this covers OOS from sync.
+	 *
+	 * @return int[]
+	 */
+	public function get_restock_product_ids() {
+		return $this->get_linked_product_ids();
+	}
+
+	/**
+	 * Put a product back on sale after a Clover stock import marked it out of stock.
+	 *
+	 * Default mode turns OFF WooCommerce stock management so the site sells without
+	 * quantity tracking (typical for restaurants). Optional set_quantity mode keeps
+	 * tracking on and writes a positive quantity.
+	 *
+	 * @param WC_Product $product  Product or variation.
+	 * @param string     $mode     disable_tracking|set_quantity
+	 * @param int|float  $quantity Quantity when mode is set_quantity.
+	 * @return string updated|unchanged|skipped_parent
+	 */
+	public function restock_product( $product, $mode = 'disable_tracking', $quantity = 100 ) {
+		if ( ! $product instanceof WC_Product ) {
+			return 'unchanged';
+		}
+		if ( $product->is_type( array( 'variable', 'grouped' ) ) ) {
+			return 'skipped_parent';
+		}
+
+		$mode = ( 'set_quantity' === $mode ) ? 'set_quantity' : 'disable_tracking';
+
+		self::$applying_clover_stock = true;
+		try {
+			if ( 'set_quantity' === $mode ) {
+				$target = function_exists( 'wc_stock_amount' ) ? wc_stock_amount( $quantity ) : (float) $quantity;
+				if ( (float) $target < 0 ) {
+					$target = 0;
+				}
+				$product->set_manage_stock( true );
+				$product->set_stock_quantity( $target );
+				$product->set_stock_status( $this->stock_status_for_quantity( $product, $target ) );
+			} else {
+				$product->set_manage_stock( false );
+				$product->set_stock_status( 'instock' );
+			}
+
+			$product->delete_meta_data( '_clover_stock_quantity' );
+			$product->delete_meta_data( '_clover_stock_synced_at' );
+			$product->save();
+
+			do_action( $product->is_type( 'variation' ) ? 'woocommerce_variation_set_stock' : 'woocommerce_product_set_stock', $product );
+		} finally {
+			self::$applying_clover_stock = false;
+		}
+
+		return 'updated';
+	}
+
+	/**
+	 * Restock products in batches (AJAX / admin).
+	 *
+	 * @param int             $offset     Offset into the product list.
+	 * @param int             $batch_size Batch size.
+	 * @param string          $token      Batch token (empty starts a new run).
+	 * @param string          $mode       disable_tracking|set_quantity
+	 * @param int|float       $quantity   Quantity for set_quantity mode.
+	 * @return array
+	 */
+	public function restock_products_batch( $offset, $batch_size, $token = '', $mode = 'disable_tracking', $quantity = 100 ) {
+		$offset     = max( 0, (int) $offset );
+		$batch_size = max( 1, min( 50, (int) $batch_size ) );
+		$token      = preg_replace( '/[^a-zA-Z0-9]/', '', (string) $token );
+		$mode       = ( 'set_quantity' === $mode ) ? 'set_quantity' : 'disable_tracking';
+		$quantity   = function_exists( 'wc_stock_amount' ) ? wc_stock_amount( $quantity ) : (float) $quantity;
+
+		if ( 0 === $offset || '' === $token ) {
+			$ids = $this->get_restock_product_ids();
+			if ( empty( $ids ) ) {
+				return array(
+					'success'        => true,
+					'empty'          => true,
+					'token'          => '',
+					'total'          => 0,
+					'processed'      => 0,
+					'next_offset'    => 0,
+					'updated'        => 0,
+					'unchanged'      => 0,
+					'skipped_parent' => 0,
+					'errors'         => 0,
+					'messages'       => array(),
+					'done'           => true,
+				);
+			}
+
+			try {
+				$token = bin2hex( random_bytes( 8 ) );
+			} catch ( Exception $e ) {
+				$token = wp_generate_password( 16, false, false );
+			}
+
+			set_transient(
+				'clover_restock_' . $token,
+				array(
+					'ids'      => $ids,
+					'mode'     => $mode,
+					'quantity' => $quantity,
+				),
+				15 * MINUTE_IN_SECONDS
+			);
+		}
+
+		$state = get_transient( 'clover_restock_' . $token );
+		if ( ! is_array( $state ) || empty( $state['ids'] ) || ! is_array( $state['ids'] ) ) {
+			return array(
+				'success' => false,
+				'message' => __( 'This restock run expired. Start it again.', 'clover-gateway' ),
+			);
+		}
+
+		$mode     = isset( $state['mode'] ) ? $state['mode'] : $mode;
+		$quantity = isset( $state['quantity'] ) ? $state['quantity'] : $quantity;
+		$total    = count( $state['ids'] );
+		$batch    = array_slice( $state['ids'], $offset, $batch_size );
+		$counts   = array(
+			'updated'        => 0,
+			'unchanged'      => 0,
+			'skipped_parent' => 0,
+			'errors'         => 0,
+		);
+		$messages = array();
+
+		foreach ( $batch as $product_id ) {
+			$product = wc_get_product( (int) $product_id );
+			if ( ! $product ) {
+				$counts['errors']++;
+				continue;
+			}
+			try {
+				$status = $this->restock_product( $product, $mode, $quantity );
+				if ( isset( $counts[ $status ] ) ) {
+					$counts[ $status ]++;
+				} else {
+					$counts['updated']++;
+				}
+			} catch ( Throwable $e ) {
+				$counts['errors']++;
+				if ( count( $messages ) < 8 ) {
+					$messages[] = $product->get_name() . ': ' . $e->getMessage();
+				}
+			}
+		}
+
+		$processed = $offset + count( $batch );
+		$done      = ( $processed >= $total ) || empty( $batch );
+		if ( $done ) {
+			delete_transient( 'clover_restock_' . $token );
+		}
+
+		return array(
+			'success'        => true,
+			'token'          => $token,
+			'total'          => $total,
+			'processed'      => $processed,
+			'next_offset'    => $processed,
+			'updated'        => $counts['updated'],
+			'unchanged'      => $counts['unchanged'],
+			'skipped_parent' => $counts['skipped_parent'],
+			'errors'         => $counts['errors'],
+			'messages'       => $messages,
+			'done'           => $done,
+		);
+	}
+
+	/**
 	 * Fifteen-minute cron interval for stock reconciliation.
 	 *
 	 * @param array $schedules Existing intervals.
@@ -1359,17 +1535,63 @@ class Clover_Inventory_Sync {
 	}
 
 	/**
+	 * Whether the recurring Clover→WooCommerce stock check is enabled.
+	 *
+	 * @return bool
+	 */
+	public function is_stock_reconcile_enabled() {
+		return 'yes' === get_option( 'clover_stock_reconcile_enabled', 'no' );
+	}
+
+	/**
+	 * Persist the stock-check setting and sync the schedule immediately.
+	 *
+	 * @param bool $enabled Whether the 15-minute check should run.
+	 * @return bool The saved enabled state.
+	 */
+	public function set_stock_reconcile_enabled( $enabled ) {
+		$value = $enabled ? 'yes' : 'no';
+		update_option( 'clover_stock_reconcile_enabled', $value, false );
+
+		// Re-read after write so object-cache / autoload quirks cannot leave a stale "on".
+		$saved = $this->is_stock_reconcile_enabled();
+		if ( $enabled && ! $saved ) {
+			update_option( 'clover_stock_reconcile_enabled', 'yes', false );
+			$saved = true;
+		} elseif ( ! $enabled && $saved ) {
+			update_option( 'clover_stock_reconcile_enabled', 'no', false );
+			$saved = false;
+		}
+
+		$this->sync_reconcile_schedule();
+		return $saved;
+	}
+
+	/**
+	 * Clear every scheduled stock-reconcile job (WP-Cron + Action Scheduler).
+	 *
+	 * @param string $hook Cron / AS hook name.
+	 */
+	protected function clear_reconcile_schedule( $hook ) {
+		wp_clear_scheduled_hook( $hook );
+		delete_transient( 'clover_stock_reconcile_lock' );
+
+		if ( function_exists( 'as_unschedule_all_actions' ) ) {
+			as_unschedule_all_actions( $hook, array(), 'clover-gateway' );
+			// Also clear any jobs scheduled without our group (older installs).
+			as_unschedule_all_actions( $hook, array(), '' );
+		}
+	}
+
+	/**
 	 * Schedule or clear the Clover stock check.
 	 */
 	public function sync_reconcile_schedule() {
 		$hook    = 'clover_gateway_reconcile_stock';
-		$enabled = ( 'yes' === get_option( 'clover_stock_reconcile_enabled', 'no' ) );
+		$enabled = $this->is_stock_reconcile_enabled();
 
 		if ( ! $enabled ) {
-			wp_clear_scheduled_hook( $hook );
-			if ( function_exists( 'as_unschedule_all_actions' ) ) {
-				as_unschedule_all_actions( $hook, array(), 'clover-gateway' );
-			}
+			$this->clear_reconcile_schedule( $hook );
 			return;
 		}
 
@@ -1392,7 +1614,8 @@ class Clover_Inventory_Sync {
 	 * Variations that share a Clover item receive that same quantity.
 	 */
 	public function reconcile_stock_cron() {
-		if ( 'yes' !== get_option( 'clover_stock_reconcile_enabled', 'no' ) ) {
+		if ( ! $this->is_stock_reconcile_enabled() ) {
+			$this->clear_reconcile_schedule( 'clover_gateway_reconcile_stock' );
 			return;
 		}
 		if ( get_transient( 'clover_stock_reconcile_lock' ) ) {

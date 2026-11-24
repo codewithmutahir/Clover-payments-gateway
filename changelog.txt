@@ -1,5 +1,10 @@
 *** Clover Payment Gateway for WooCommerce Changelog ***
 
+2026-10-31 - version 1.0.26
+* Fix - Unchecking "Keep linked stock updated from Clover every 15 minutes" now reliably saves OFF (admin-post + hidden "no" field) and clears WP-Cron / Action Scheduler jobs plus the reconcile lock.
+* Add - Restock section on WooCommerce → Clover Sync: put linked / previously synced products back In Stock. Default turns off Manage stock so the shop stops going OOS from Clover quantities; optional mode sets a fixed quantity instead.
+* Note - Turning the stock check OFF does not undo quantities already written. Use Restock after disabling if products show out of stock.
+
 2026-10-26 - version 1.0.25
 * Fix - Kitchen/receipt tickets showing garbage inside product names (e.g. "C| 6s8hicken" instead of "Chicken"). The previous kitchen-safe name hack inserted a zero-width non-joiner (U+200C) that thermal printers cannot render. Names are now plain printable text only.
 * Fix - Strip zero-width / control characters from all Clover line item names and order notes before sync so product titles or customer notes cannot leak unprintable Unicode onto tickets.

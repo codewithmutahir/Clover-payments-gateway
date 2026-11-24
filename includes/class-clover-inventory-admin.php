@@ -30,6 +30,8 @@ class Clover_Inventory_Admin {
 		add_action( 'wp_ajax_clover_get_tax_rates', array( $this, 'ajax_get_tax_rates' ) );
 		add_action( 'wp_ajax_clover_export_batch', array( $this, 'ajax_export_batch' ) );
 		add_action( 'wp_ajax_clover_import_stock_batch', array( $this, 'ajax_import_stock_batch' ) );
+		add_action( 'wp_ajax_clover_restock_batch', array( $this, 'ajax_restock_batch' ) );
+		add_action( 'admin_post_clover_save_stock_reconcile', array( $this, 'handle_save_stock_reconcile' ) );
 	}
 
 	public function add_menu() {
@@ -74,8 +76,6 @@ class Clover_Inventory_Admin {
 	// ------------------------------------------------------------------
 
 	public function render_page() {
-		$this->maybe_save_reconcile_setting();
-
 		$cached = get_transient( 'clover_sync_dry_run' );
 		if ( is_array( $cached ) && ! empty( $cached ) ) {
 			$cached = Clover_Inventory_Sync::instance()->reconcile_dry_run_results( $cached );
@@ -87,6 +87,8 @@ class Clover_Inventory_Admin {
 		?>
 		<div class="wrap">
 			<h1><?php esc_html_e( 'Clover Inventory Sync', 'clover-gateway' ); ?></h1>
+
+			<?php $this->render_stock_notices(); ?>
 
 			<?php /* ── STOCK IMPORT ──────────────────────────────────────── */ ?>
 			<div class="clover-sync-card">
@@ -105,6 +107,7 @@ class Clover_Inventory_Admin {
 				<div id="clover-stock-import-message"></div>
 
 				<?php $this->render_reconcile_setting(); ?>
+				<?php $this->render_restock_section(); ?>
 			</div>
 
 			<?php /* ── EXPORT SECTION ─────────────────────────────────────── */ ?>
@@ -217,36 +220,80 @@ class Clover_Inventory_Admin {
 	}
 
 	/**
-	 * Save the recurring stock-check setting.
+	 * Admin notices after saving the stock-check setting.
 	 */
-	protected function maybe_save_reconcile_setting() {
-		if ( ! isset( $_POST['clover_save_stock_reconcile'] ) ) {
+	protected function render_stock_notices() {
+		if ( empty( $_GET['clover_stock_saved'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			return;
 		}
+
+		$enabled = Clover_Inventory_Sync::instance()->is_stock_reconcile_enabled();
+		echo '<div class="notice notice-success is-dismissible"><p>';
+		if ( $enabled ) {
+			esc_html_e( 'Stock check saved: ON. Linked WooCommerce quantities will update from Clover every 15 minutes.', 'clover-gateway' );
+		} else {
+			esc_html_e( 'Stock check saved: OFF. Scheduled Clover stock updates are cleared. Products already marked out of stock stay that way until you use Restock below.', 'clover-gateway' );
+		}
+		echo '</p></div>';
+	}
+
+	/**
+	 * Handle Save stock check via admin-post (PRG) so the checkbox state always sticks.
+	 */
+	public function handle_save_stock_reconcile() {
 		if ( ! current_user_can( 'manage_woocommerce' ) ) {
-			return;
+			wp_die( esc_html__( 'Forbidden', 'clover-gateway' ), 403 );
 		}
 		check_admin_referer( 'clover_stock_reconcile' );
-		$enabled = isset( $_POST['clover_stock_reconcile_enabled'] ) ? 'yes' : 'no';
-		update_option( 'clover_stock_reconcile_enabled', $enabled, false );
-		Clover_Inventory_Sync::instance()->sync_reconcile_schedule();
+
+		// Hidden field posts "no"; checked checkbox posts "yes" after it and wins.
+		$raw = 'no';
+		if ( isset( $_POST['clover_stock_reconcile_enabled'] ) ) {
+			$posted = wp_unslash( $_POST['clover_stock_reconcile_enabled'] );
+			if ( is_array( $posted ) ) {
+				$posted = end( $posted );
+			}
+			$raw = sanitize_text_field( (string) $posted );
+		}
+		$enabled = ( 'yes' === $raw );
+
+		Clover_Inventory_Sync::instance()->set_stock_reconcile_enabled( $enabled );
+
+		wp_safe_redirect(
+			add_query_arg(
+				array(
+					'page'               => 'clover-inventory-sync',
+					'clover_stock_saved' => '1',
+				),
+				admin_url( 'admin.php' )
+			)
+		);
+		exit;
 	}
 
 	/**
 	 * Recurring Clover-to-WooCommerce stock check.
 	 */
 	protected function render_reconcile_setting() {
-		$enabled = ( 'yes' === get_option( 'clover_stock_reconcile_enabled', 'no' ) );
+		$enabled = Clover_Inventory_Sync::instance()->is_stock_reconcile_enabled();
 		$last    = get_option( 'clover_stock_reconcile_last', array() );
 		?>
-		<form method="post" style="margin-top:16px">
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top:16px;padding-top:16px;border-top:1px solid #dcdcde">
 			<?php wp_nonce_field( 'clover_stock_reconcile' ); ?>
-			<input type="hidden" name="clover_save_stock_reconcile" value="1" />
+			<input type="hidden" name="action" value="clover_save_stock_reconcile" />
+			<input type="hidden" name="clover_stock_reconcile_enabled" value="no" />
 			<label>
 				<input type="checkbox" name="clover_stock_reconcile_enabled" value="yes" <?php checked( $enabled ); ?> />
 				<?php esc_html_e( 'Keep linked stock updated from Clover every 15 minutes', 'clover-gateway' ); ?>
 			</label>
-			<p class="description"><?php esc_html_e( 'Register sales update the site on this schedule. Variations linked to the same Clover item are set to that same quantity. Turn this on after the links look right.', 'clover-gateway' ); ?></p>
+			<p class="description">
+				<?php
+				echo $enabled
+					? '<strong>' . esc_html__( 'Currently: ON', 'clover-gateway' ) . '</strong> — '
+					: '<strong>' . esc_html__( 'Currently: OFF', 'clover-gateway' ) . '</strong> — ';
+				esc_html_e( 'When ON, register sales update the site on this schedule. Uncheck and click Save to turn it off completely. Turning it off does not restock products that were already set to out of stock — use Restock below for that.', 'clover-gateway' );
+				?>
+			</p>
 			<?php
 			if ( is_array( $last ) && ! empty( $last['time'] ) ) {
 				$counts = isset( $last['counts'] ) && is_array( $last['counts'] ) ? $last['counts'] : array();
@@ -267,8 +314,47 @@ class Clover_Inventory_Admin {
 				echo '</p>';
 			}
 			?>
-			<p><button type="submit" class="button"><?php esc_html_e( 'Save stock check', 'clover-gateway' ); ?></button></p>
+			<p><button type="submit" class="button button-primary"><?php esc_html_e( 'Save stock check', 'clover-gateway' ); ?></button></p>
 		</form>
+		<?php
+	}
+
+	/**
+	 * Restock products that Clover stock sync marked out of stock.
+	 */
+	protected function render_restock_section() {
+		$reconcile_on = Clover_Inventory_Sync::instance()->is_stock_reconcile_enabled();
+		?>
+		<div style="margin-top:16px;padding-top:16px;border-top:1px solid #dcdcde">
+			<h3 style="margin-top:0"><?php esc_html_e( 'Restock products', 'clover-gateway' ); ?></h3>
+			<p><?php esc_html_e( 'Use this after turning the stock check OFF if the site shows everything out of stock. It puts linked / previously synced products back In Stock. By default it also turns off WooCommerce “Manage stock” so quantities stop controlling availability.', 'clover-gateway' ); ?></p>
+			<?php if ( $reconcile_on ) : ?>
+				<div class="notice notice-warning inline"><p><?php esc_html_e( 'Stock check is still ON. Turn it OFF and Save first, or the next 15-minute sync / import can mark products out of stock again.', 'clover-gateway' ); ?></p></div>
+			<?php endif; ?>
+			<p>
+				<label>
+					<input type="radio" name="clover_restock_mode" value="disable_tracking" checked />
+					<?php esc_html_e( 'In Stock + turn off Manage stock (recommended)', 'clover-gateway' ); ?>
+				</label>
+				<br />
+				<label>
+					<input type="radio" name="clover_restock_mode" value="set_quantity" />
+					<?php esc_html_e( 'Keep Manage stock on and set quantity to', 'clover-gateway' ); ?>
+					<input type="number" id="clover-restock-qty" value="100" min="1" step="1" style="width:80px;margin-left:4px" />
+				</label>
+			</p>
+			<p>
+				<button type="button" id="clover-start-restock" class="button"><?php esc_html_e( 'Restock products now', 'clover-gateway' ); ?></button>
+				<span id="clover-restock-spinner" class="spinner" style="float:none"></span>
+			</p>
+			<div id="clover-restock-progress" style="display:none;max-width:500px;margin-top:8px">
+				<div style="background:#e2e3e5;border-radius:4px;overflow:hidden;height:20px">
+					<div id="clover-restock-bar" style="background:#00a32a;height:100%;width:0%;transition:width .3s"></div>
+				</div>
+				<p id="clover-restock-progress-text" style="margin-top:4px;font-size:13px"></p>
+			</div>
+			<div id="clover-restock-message"></div>
+		</div>
 		<?php
 	}
 
@@ -547,6 +633,32 @@ class Clover_Inventory_Admin {
 			wp_send_json_error(
 				array(
 					'message' => isset( $result['message'] ) ? $result['message'] : __( 'Stock import failed.', 'clover-gateway' ),
+				)
+			);
+		}
+
+		wp_send_json_success( $result );
+	}
+
+	/**
+	 * AJAX: Restock linked / previously synced products.
+	 */
+	public function ajax_restock_batch() {
+		check_ajax_referer( 'clover_inventory_sync', 'nonce' );
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_send_json_error( array( 'message' => __( 'Forbidden', 'clover-gateway' ) ), 403 );
+		}
+
+		$offset   = isset( $_POST['offset'] ) ? (int) $_POST['offset'] : 0;
+		$token    = isset( $_POST['token'] ) ? sanitize_text_field( wp_unslash( $_POST['token'] ) ) : '';
+		$mode     = isset( $_POST['mode'] ) ? sanitize_text_field( wp_unslash( $_POST['mode'] ) ) : 'disable_tracking';
+		$quantity = isset( $_POST['quantity'] ) ? (float) $_POST['quantity'] : 100;
+
+		$result = Clover_Inventory_Sync::instance()->restock_products_batch( $offset, 25, $token, $mode, $quantity );
+		if ( empty( $result['success'] ) ) {
+			wp_send_json_error(
+				array(
+					'message' => isset( $result['message'] ) ? $result['message'] : __( 'Restock failed.', 'clover-gateway' ),
 				)
 			);
 		}
